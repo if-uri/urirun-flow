@@ -57,10 +57,10 @@ uri, payload, depends_on}]}`). `urirun-flow` is its Python (Pydantic) model; the
 builder→dict mapping is implementable in any typed language and emits the identical
 YAML — exactly how the urirun connector SDKs stay in lockstep across languages.
 
-`flow.ts` sketches the TypeScript surface (typed builder, `.ref()`, `toYAML()`), so
-TS/JS authors get the same control. A future `urirun-flow conformance` would compare
-each language's emitted YAML against the Python reference, like `make conformance`
-does for connector bindings.
+`js/urirun-flow.js` is a runnable JS/TS emitter (typed via `js/urirun-flow.d.ts`) that
+builds the **identical** flow contract. `make conformance` builds the same reference
+flow in every language and asserts they agree — like `make conformance` for connector
+bindings. Verified: **2/2 emitters agree** (Python + JS).
 
 ## License
 Apache-2.0 — see [LICENSE](LICENSE) / [NOTICE](NOTICE).
