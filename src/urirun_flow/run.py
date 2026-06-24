@@ -68,6 +68,34 @@ def _skip_envelope(step: Step, reason: str) -> dict:
             "error": {"type": "dependency", "category": "FAILED_PRECONDITION", "message": reason}}
 
 
+def flow_summary(results: dict[str, Any]) -> dict[str, Any]:
+    """Roll up a ``{step_id: envelope}`` result into a partial-result summary so a broken chain
+    SURFACES instead of vanishing: which steps succeeded / failed / were skipped, and the first
+    error. Tagged via the shared artifact/widget contract (``urirun.tag``) as a frozen
+    ``flow-failure`` artifact when anything failed (else ``flow-result``), so the dashboard can
+    render it and ``error://`` / a ticket can pick it up. Pure — pass it the run_flow output."""
+    succeeded, failed, skipped, first_error = [], [], [], None
+    for sid, env in results.items():  # dict preserves flow (insertion) order
+        if env.get("skipped"):
+            skipped.append(sid)
+        elif envelope_ok(env):
+            succeeded.append(sid)
+        else:
+            failed.append(sid)
+            if first_error is None:
+                first_error = {"step": sid, "uri": env.get("uri"),
+                               "category": error_category(env), "error": env.get("error")}
+    summary = {"ok": not failed, "steps": len(results), "succeeded": succeeded,
+               "failed": failed, "skipped": skipped, "firstError": first_error}
+    kind = "flow-failure" if failed else "flow-result"
+    try:  # use the shared contract when urirun is importable; degrade to inline fields otherwise
+        import urirun
+        return urirun.tag(summary, kind, live=False)
+    except Exception:  # noqa: BLE001
+        summary["kind"], summary["live"] = kind, False
+        return summary
+
+
 def resolve_step(step: Step, payload: dict, run_call: Callable[[str, dict], dict], *,
                  retryable: set[str] = RETRYABLE, sleep: Callable[[float], None] = time.sleep) -> dict:
     """Run one step with its retry/fallback/assertion policy and return the final envelope.

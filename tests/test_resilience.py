@@ -9,7 +9,7 @@ import json
 import pytest
 
 from urirun_flow import Flow, Step
-from urirun_flow.run import resolve_step, run_flow, envelope_ok, error_category
+from urirun_flow.run import resolve_step, run_flow, flow_summary, envelope_ok, error_category
 
 _NOSLEEP = lambda _s: None
 
@@ -95,6 +95,28 @@ def test_assertion_pass_stays_ok():
 def test_error_category_classifies_unstamped():
     # no explicit category -> classified from the exception type
     assert error_category({"error": {"type": "TimeoutError", "message": "timed out"}}) == "DEADLINE_EXCEEDED"
+
+
+# --- flow_summary (surface a broken chain as a tagged artifact) -----------------------------
+
+def test_flow_summary_partial_failure():
+    results = {
+        "a": _okenv(),
+        "b": {"ok": False, "error": {"type": "x", "category": "UNAVAILABLE", "message": "down"}},
+        "c": {"ok": False, "skipped": True, "error": {"message": "skipped: dependencies ..."}},
+    }
+    s = flow_summary(results)
+    assert s["ok"] is False and s["steps"] == 3
+    assert s["succeeded"] == ["a"] and s["failed"] == ["b"] and s["skipped"] == ["c"]
+    assert s["firstError"]["step"] == "b" and s["firstError"]["category"] == "UNAVAILABLE"
+    # surfaced as a frozen artifact via the shared contract
+    assert s["kind"] == "flow-failure" and s["live"] is False
+
+
+def test_flow_summary_all_ok():
+    s = flow_summary({"a": _okenv(), "b": _okenv()})
+    assert s["ok"] is True and not s["failed"] and not s["skipped"]
+    assert s["kind"] == "flow-result" and s["live"] is False
 
 
 # --- run_flow (real runtime) ----------------------------------------------------------------
