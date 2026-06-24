@@ -38,15 +38,32 @@ class Step(BaseModel):
     id: str
     uri: str
     operation: str | None = None
-    kind: str | None = None  # query | command — derived from the URI tail if omitted
+    kind: str | None = None  # query | command | assertion — derived from the URI tail if omitted
     payload: dict[str, Any] = Field(default_factory=dict)
     depends_on: list[str] = Field(default_factory=list)
+    # --- resilience policy (all optional; absent = today's behaviour) --------------------------
+    # retry: {max:int, backoff_ms:int, on:[error categories]} — only retry RETRYABLE categories.
+    retry: dict[str, Any] | None = None
+    # fallback: an alternative URI to run (same payload) when the step still fails after retries.
+    fallback: str | None = None
+    # catch: what to do when the step ultimately fails — "continue" (default; dependents skip)
+    # or "abort" (stop the rest of the flow).
+    catch: str | None = None
+    # timeout_ms: per-step deadline (overrides the policy default).
+    timeout_ms: int | None = None
 
-    @field_validator("uri")
+    @field_validator("uri", "fallback")
     @classmethod
-    def _check_uri(cls, value: str) -> str:
-        if not URI_RE.match(value):
+    def _check_uri(cls, value: str | None) -> str | None:
+        if value is not None and not URI_RE.match(value):
             raise FlowError(f"not a URI: {value!r}")
+        return value
+
+    @field_validator("catch")
+    @classmethod
+    def _check_catch(cls, value: str | None) -> str | None:
+        if value is not None and value not in ("continue", "abort"):
+            raise FlowError(f"catch must be 'continue' or 'abort', got {value!r}")
         return value
 
     @model_validator(mode="after")
@@ -73,12 +90,14 @@ class Flow(BaseModel):
     # --- typed builder -------------------------------------------------------
     def step(self, uri: str, *, id: str | None = None, payload: dict | None = None,
              after: list[Any] | None = None, operation: str | None = None,
-             kind: str | None = None) -> Step:
+             kind: str | None = None, retry: dict | None = None, fallback: str | None = None,
+             catch: str | None = None, timeout_ms: int | None = None) -> Step:
         """Append a step and return it (so later steps can `.ref()` its output)."""
         sid = id or f"s{len(self.steps) + 1}"
         deps = [a.id if isinstance(a, Step) else str(a) for a in (after or [])]
         st = Step(id=sid, uri=uri, payload=payload or {}, depends_on=deps,
-                  operation=operation, kind=kind)
+                  operation=operation, kind=kind, retry=retry, fallback=fallback,
+                  catch=catch, timeout_ms=timeout_ms)
         self.steps.append(st)
         self._validate_graph()
         return st
@@ -151,6 +170,14 @@ class Flow(BaseModel):
                 entry["payload"] = s.payload
             if s.depends_on:
                 entry["depends_on"] = s.depends_on
+            if s.retry:
+                entry["retry"] = s.retry
+            if s.fallback:
+                entry["fallback"] = s.fallback
+            if s.catch:
+                entry["catch"] = s.catch
+            if s.timeout_ms:
+                entry["timeout_ms"] = s.timeout_ms
             steps.append(entry)
         out["steps"] = steps
         return out
