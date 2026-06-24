@@ -165,6 +165,39 @@ def test_catch_abort_stops_flow(tmp_path):
     assert results["b"].get("skipped") is True
 
 
+def test_degrade_serves_last_good_when_step_fails(tmp_path):
+    # a failed live step degrades to an earlier good step's result (live widget -> last artifact)
+    _registry(tmp_path)
+    flow = Flow(registry="reg.json", allow=["demo://*"])
+    good = flow.step("demo://host/echo/command/say", id="good")          # produces a result
+    flow.step("demo://host/fail/command/run", id="live", degrade=good)   # fails -> degrade
+    dep = flow.step("demo://host/echo/command/say", id="dep", after=["live"])  # must still run
+    results = run_flow(flow, tmp_path, execute=True)
+    assert results["live"]["degraded"] is True and results["live"]["ok"] is True
+    assert results["live"]["live"] is False and results["live"]["degradedFrom"] == "good"
+    # the served result is the good step's result (last-good data)
+    assert results["live"]["result"] == results["good"]["result"]
+    # the dependent ran (chain kept alive on degraded data)
+    assert results["dep"].get("skipped") is not True and results["dep"]["ok"] is True
+    s = flow_summary(results)
+    assert s["degraded"] == ["live"] and s["ok"] is True
+
+
+def test_degrade_not_used_when_primary_ok(tmp_path):
+    _registry(tmp_path)
+    flow = Flow(registry="reg.json", allow=["demo://*"])
+    flow.step("demo://host/echo/command/say", id="good")
+    flow.step("demo://host/ok/command/run", id="live", degrade="good")
+    results = run_flow(flow, tmp_path, execute=True)
+    assert results["live"]["ok"] is True and results["live"].get("degraded") is not True
+
+
+def test_degrade_to_unknown_step_rejected():
+    with pytest.raises(Exception):  # FlowError
+        f = Flow(registry="r.json")
+        f.step("demo://h/x/command/run", id="a", degrade="nope")
+
+
 def test_happy_flow_unchanged(tmp_path):
     # a flow with no resilience config and all-ok steps behaves exactly as before
     _registry(tmp_path)

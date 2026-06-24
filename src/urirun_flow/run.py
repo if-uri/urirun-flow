@@ -11,6 +11,9 @@ crashes when a dependent references a failed step):
 * ``retry`` ``{max, backoff_ms, on}`` — re-run the step while it fails with a RETRYABLE error
   category (UNAVAILABLE / DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED / ABORTED by default).
 * ``fallback`` — an alternative URI (same payload) tried once after retries are exhausted.
+* ``degrade`` — id of an earlier step whose last-good result is served (re-tagged
+  ``live=False``/``degraded=True``) when this step still fails, so a failing live widget
+  falls back to the last frozen artifact and the chain stays alive on known-good data.
 * ``catch`` — ``"continue"`` (default: dependents skip) or ``"abort"`` (stop the flow).
 * an ``assertion`` step that does not pass gates its dependents (they skip).
 
@@ -74,10 +77,12 @@ def flow_summary(results: dict[str, Any]) -> dict[str, Any]:
     error. Tagged via the shared artifact/widget contract (``urirun.tag``) as a frozen
     ``flow-failure`` artifact when anything failed (else ``flow-result``), so the dashboard can
     render it and ``error://`` / a ticket can pick it up. Pure — pass it the run_flow output."""
-    succeeded, failed, skipped, first_error = [], [], [], None
+    succeeded, degraded, failed, skipped, first_error = [], [], [], [], None
     for sid, env in results.items():  # dict preserves flow (insertion) order
         if env.get("skipped"):
             skipped.append(sid)
+        elif env.get("degraded"):
+            degraded.append(sid)  # ran on last-good data — succeeded, but flagged stale
         elif envelope_ok(env):
             succeeded.append(sid)
         else:
@@ -86,7 +91,7 @@ def flow_summary(results: dict[str, Any]) -> dict[str, Any]:
                 first_error = {"step": sid, "uri": env.get("uri"),
                                "category": error_category(env), "error": env.get("error")}
     summary = {"ok": not failed, "steps": len(results), "succeeded": succeeded,
-               "failed": failed, "skipped": skipped, "firstError": first_error}
+               "degraded": degraded, "failed": failed, "skipped": skipped, "firstError": first_error}
     kind = "flow-failure" if failed else "flow-result"
     try:  # use the shared contract when urirun is importable; degrade to inline fields otherwise
         import urirun
@@ -192,8 +197,18 @@ def run_flow(flow: Flow, base_dir: str | Path = ".", *, execute: bool = False,
             return v2.run(uri, registry, pl, mode=mode, policy=_pol)
 
         env = resolve_step(step, payload, run_call)
-        results[step.id] = env
         ok = envelope_ok(env)
+
+        # Degrade: a failed step serves an earlier step's last-good result instead of breaking
+        # the chain — re-tagged live=False/degraded=True (a live widget → last frozen artifact).
+        if not ok and step.degrade and status.get(step.degrade) == "ok":
+            good = results[step.degrade]
+            env = {"uri": step.uri, "ok": True, "degraded": True, "degradedFrom": step.degrade,
+                   "primaryError": env.get("error"), "result": good.get("result"),
+                   "kind": "degraded", "live": False}
+            ok = True
+
+        results[step.id] = env
         status[step.id] = "ok" if ok else "failed"
         if not ok and (step.catch or "continue") == "abort":
             aborted = True

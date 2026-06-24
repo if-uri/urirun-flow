@@ -51,6 +51,11 @@ class Step(BaseModel):
     catch: str | None = None
     # timeout_ms: per-step deadline (overrides the policy default).
     timeout_ms: int | None = None
+    # degrade: id of an earlier step whose last-good result is served (re-tagged live=False,
+    # degraded=True) when THIS step fails after retries+fallback — so a failing live widget
+    # falls back to the last frozen artifact instead of breaking the chain. Distinct from
+    # `fallback` (which makes another live call); degrade serves known-good data, no new call.
+    degrade: str | None = None
 
     @field_validator("uri", "fallback")
     @classmethod
@@ -91,13 +96,15 @@ class Flow(BaseModel):
     def step(self, uri: str, *, id: str | None = None, payload: dict | None = None,
              after: list[Any] | None = None, operation: str | None = None,
              kind: str | None = None, retry: dict | None = None, fallback: str | None = None,
-             catch: str | None = None, timeout_ms: int | None = None) -> Step:
+             catch: str | None = None, timeout_ms: int | None = None,
+             degrade: "str | Step | None" = None) -> Step:
         """Append a step and return it (so later steps can `.ref()` its output)."""
         sid = id or f"s{len(self.steps) + 1}"
         deps = [a.id if isinstance(a, Step) else str(a) for a in (after or [])]
         st = Step(id=sid, uri=uri, payload=payload or {}, depends_on=deps,
                   operation=operation, kind=kind, retry=retry, fallback=fallback,
-                  catch=catch, timeout_ms=timeout_ms)
+                  catch=catch, timeout_ms=timeout_ms,
+                  degrade=degrade.id if isinstance(degrade, Step) else degrade)
         self.steps.append(st)
         self._validate_graph()
         return st
@@ -117,8 +124,10 @@ class Flow(BaseModel):
             for dep in s.depends_on:
                 if dep not in known:
                     raise FlowError(f"step {s.id!r} depends on unknown step {dep!r}")
-        # cycle detection (DFS)
-        graph = {s.id: list(s.depends_on) for s in self.steps}
+            if s.degrade is not None and s.degrade not in known:
+                raise FlowError(f"step {s.id!r} degrades to unknown step {s.degrade!r}")
+        # cycle detection (DFS) — degrade is also an ordering edge (its source must run first)
+        graph = {s.id: list(s.depends_on) + ([s.degrade] if s.degrade else []) for s in self.steps}
         state: dict[str, int] = {}
 
         def visit(node: str) -> None:
@@ -145,6 +154,8 @@ class Flow(BaseModel):
                 return
             for dep in by_id[sid].depends_on:
                 emit(dep)
+            if by_id[sid].degrade:  # the degrade source must be ordered before this step
+                emit(by_id[sid].degrade)
             seen.add(sid)
             out.append(by_id[sid])
 
@@ -178,6 +189,8 @@ class Flow(BaseModel):
                 entry["catch"] = s.catch
             if s.timeout_ms:
                 entry["timeout_ms"] = s.timeout_ms
+            if s.degrade:
+                entry["degrade"] = s.degrade
             steps.append(entry)
         out["steps"] = steps
         return out
