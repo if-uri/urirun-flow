@@ -4,18 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "urirun-flow"
-version = "0.1.0"
-description = "Author urirun URI flows in typed Python (Pydantic) and convert to/from YAML."
+version = "0.2.0"
+description = "Meta-package: author urirun URI flows in typed Python (Pydantic) and convert to/from YAML. The `urirun_flow` import package (DSL + engine) and the `urirun-flow` console script now ship inside the `urirun` distribution (the single source of truth); this distribution just depends on it so `pip install urirun-flow` and `import urirun_flow` keep working."
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.9"
-dependencies = ["pydantic>=2", "PyYAML>=6"]
+requires-python = ">=3.10"
+# Meta-package: ships NO import package of its own (the bundled `urirun` owns `urirun_flow`,
+# which holds both the typed-flow DSL and the flow engine), so installing this alongside
+# `urirun` cannot shadow the bundle copy. The `urirun-flow` console script comes from `urirun`.
+dependencies = ["urirun>=0.4.186"]
 
-[project.optional-dependencies]
-run = ["urirun"]
-
-[project.scripts]
-urirun-flow = "urirun_flow.cli:main"
-
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = []                # meta-package — no import package shipped
