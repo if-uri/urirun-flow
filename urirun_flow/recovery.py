@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from urirun_flow.diagnostics import diagnose
-from urirun.node.routing import route_target
+from urirun_connector_router.routing import route_target
 from urirun.runtime import errors as uri_errors
 
 

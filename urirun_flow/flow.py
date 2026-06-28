@@ -16,9 +16,9 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from urirun import result_data
 from urirun.runtime import v2_service
-from urirun.node._util import json_write, now_id, slug
+from urirun_flow.envelope import result_data
+from urirun_flow._util import json_write
 from urirun_flow.diagnostics import diagnose, fit_to_environment
 from urirun_flow.flow_thin import (  # noqa: F401
     FlowEnvelope,
@@ -59,7 +59,7 @@ from urirun_flow.recovery import (
     recovery_plan,
     step_target,
 )
-from urirun.node.routing import (
+from urirun_connector_router.routing import (
     diagnose_plan as diagnose_routing_plan,
     execution_layers as routing_execution_layers,
     registry_from_routes,

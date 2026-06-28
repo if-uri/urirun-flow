@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
-from urirun.node.routing import route_target
+from urirun_connector_router.routing import route_target
 
 
 def _target(step: dict | None) -> str:

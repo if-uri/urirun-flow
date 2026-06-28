@@ -2,6 +2,19 @@
 
 All notable changes to **urirun-flow** ([Keep a Changelog](https://keepachangelog.com), [SemVer](https://semver.org)).
 
+## [0.2.2]
+
+### Changed
+- Pure helper modules (`envelope`, `flow_thin`, `flow_verify`) no longer import the
+  `urirun` hub runtime just to unwrap envelopes or resolve route targets.
+- Flow-local utility helpers (`now_id`, `slug`, `json_write`, `quiet_completion`)
+  are now owned by `urirun-flow`, avoiding the historical `urirun.node._util` shim
+  for pure flow planning code.
+- LLM-backed planning now has an explicit `llm` extra (`litellm>=1.60`) on
+  `urirun-flow`.
+- Flow routing helpers import the real-source `urirun-connector-router` package
+  directly instead of the historical `urirun.node.routing` shim.
+
 ## [0.2.1]
 
 ### Changed

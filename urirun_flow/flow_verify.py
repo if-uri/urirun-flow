@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from urirun import result_data
+from urirun_flow.envelope import result_data
 
 
 def _flow_stdout(envelope: dict) -> str:

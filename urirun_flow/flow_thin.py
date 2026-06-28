@@ -15,8 +15,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from urirun import result_data
-from urirun.node.routing import route_target
+from urirun_flow.envelope import result_data
+from urirun_connector_router.routing import route_target
 
 
 # ─── Shared step utilities ────────────────────────────────────────────────────

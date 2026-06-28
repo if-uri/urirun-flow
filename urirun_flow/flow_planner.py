@@ -12,11 +12,11 @@ import os
 import re
 import unicodedata
 
-from urirun import result_data
 from urirun.runtime import v2_service
-from urirun.node._util import now_id, slug
 from urirun.node.reversible import TwinMemory
-from urirun.node.routing import (
+from urirun_flow.envelope import result_data
+from urirun_flow._util import now_id, quiet_completion, slug
+from urirun_connector_router.routing import (
     registry_from_routes,
     route_target,
     route_targets_for_nodes,
@@ -80,7 +80,6 @@ def _flow_intents_llm(prompt: str) -> dict[str, bool] | None:
     if not model:
         return None
     try:
-        from urirun.node._util import quiet_completion
         import json as _json
         names_csv = ", ".join(sorted(_INTENT_NAMES))
         resp = quiet_completion(
@@ -670,7 +669,6 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
     model = os.getenv("URIRUN_LLM_MODEL") or os.getenv("LLM_MODEL")
     if not model:
         raise RuntimeError("URIRUN_LLM_MODEL or LLM_MODEL is not set")
-    from urirun.node._util import quiet_completion
 
     allowed_routes = [
         {
