@@ -855,7 +855,8 @@ def normalize_flow_or_explain(
 # ── LLM flow generation ───────────────────────────────────────────────────────
 
 def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
-             environments: list[dict] | None = None) -> dict:
+             environments: list[dict] | None = None,
+             retrieval: dict | None = None) -> dict:
     model = os.getenv("URIRUN_LLM_MODEL") or os.getenv("LLM_MODEL")
     if not model:
         raise RuntimeError("URIRUN_LLM_MODEL or LLM_MODEL is not set")
@@ -930,6 +931,10 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
                 "unavailable value; in that case preserve the user's requested value so the deterministic "
                 "router can reject it with an actionable env-domain-invalid diagnostic. Do not guess hidden "
                 "monitor numbers or hard-code monitor labels. "
+                "If a retrieval object is present, treat its episodes/routes/preferences as PROPOSE-stage "
+                "candidates with provenance, not as accepted plans. Reuse their shape when it fits the "
+                "current request and environment, but the final plan must still use only allowedRoutes and "
+                "must be valid for the current environment. "
                 "Check 'sessionMap' per node: if the task involves a service (linkedin, google, github…) "
                 "and that service appears in sessionMap with running=false or throwaway=true or cdp_port=null, "
                 "the FIRST step must be cdp/session/command/ensure with copy_from set to the profile path "
@@ -946,6 +951,7 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
                     "request": prompt,
                     "nodes": [{"name": node["name"], "reachable": node.get("reachable")} for node in nodes],
                     "environments": environments or [],
+                    "retrieval": retrieval or {},
                     "allowedRoutes": allowed_routes,
                     "shape": {
                         "task": {"id": "short_id", "title": "title"},
@@ -1097,13 +1103,14 @@ def fetch_planner_environments(node_names: list[str], registry: dict, mesh: dict
 # ── Top-level flow generation entry point ────────────────────────────────────
 
 def make_flow(prompt: str, mesh: dict, selected_nodes: list[str] | None = None, use_llm: bool = True,
-              environments: list[dict] | None = None) -> tuple[dict, dict]:
+              environments: list[dict] | None = None,
+              retrieval: dict | None = None) -> tuple[dict, dict]:
     routes = [route for route in mesh["routes"] if safe_route(route)]
     allowed = {route["uri"] for route in routes}
     if use_llm:
         try:
             flow = normalize_flow_or_explain(
-                llm_flow(prompt, routes, mesh["nodes"], environments=environments),
+                llm_flow(prompt, routes, mesh["nodes"], environments=environments, retrieval=retrieval),
                 allowed,
                 routes=routes,
                 selected_nodes=selected_nodes,
