@@ -125,6 +125,28 @@ def test_normalize_binds_window_list_monitor_into_capture():
         "kvm://host/window/query/list",
         "kvm://host/screen/query/capture",
     }
+    routes = [
+        {
+            "uri": "kvm://host/window/query/list",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"app": {"type": "string"}, "title": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "uri": "kvm://host/screen/query/capture",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "monitor": {"type": "integer"},
+                    "scope": {"type": "string"},
+                    "output": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    ]
     flow = {
         "task": {"id": "shot"},
         "steps": [
@@ -143,7 +165,7 @@ def test_normalize_binds_window_list_monitor_into_capture():
         ],
     }
 
-    normalized = normalize_flow(flow, allowed)
+    normalized = normalize_flow(flow, allowed, routes=routes)
     capture = normalized["steps"][1]
 
     assert capture["depends_on"] == ["list_windows"]
@@ -151,6 +173,31 @@ def test_normalize_binds_window_list_monitor_into_capture():
     assert capture["payload"]["output"] == "chrome_monitor.png"
     assert "scope" not in capture["payload"]
     assert "monitor" not in capture["payload"]
+
+
+def test_normalize_rejects_unknown_result_reference_against_strict_schema():
+    allowed = {"kvm://host/screen/query/capture"}
+    routes = [{
+        "uri": "kvm://host/screen/query/capture",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"monitor": {"type": "integer"}},
+            "additionalProperties": False,
+        },
+    }]
+
+    with pytest.raises(ValueError, match="Additional properties"):
+        normalize_flow(
+            {
+                "steps": [{
+                    "id": "capture",
+                    "uri": "kvm://host/screen/query/capture",
+                    "payload": {"foo_from": "list.result.value.foo"},
+                }],
+            },
+            allowed,
+            routes=routes,
+        )
 
 
 # ─── screenshot capture repair ──────────────────────────────────────────────
@@ -273,11 +320,13 @@ def test_monitor_index_via_ekran_phrasing_is_extracted():
     assert repaired["steps"][0]["payload"] == {"monitor": 3}
 
 
-def test_recalled_all_monitors_flow_rebinds_to_specific_monitor():
-    # The recall bug: a remembered episode replayed {monitor: -1, scope: "all"} verbatim and
-    # captured ALL monitors even though the new prompt asked for monitor 3. The fresh monitor
-    # index must win, and the conflicting all-desktop scope must be cleared (the kvm contract
-    # skips `monitor` when scope is all/all-monitors/desktop).
+def test_recalled_all_monitors_scope_is_preserved_for_the_env_enum_gate():
+    # Canon (EXPERIENCE_RETRIEVAL.md): a recalled {scope: all} must NOT be silently re-bound
+    # here. Its scope is preserved so the env-enum recall gate
+    # (recall_env_enum_replan_required) detects the skipWhen and sends the flow to
+    # retrieve→propose. This layer proposes; the gate admits.
+    from urirun_flow.env_selection import recall_env_enum_replan_required
+
     recalled = {"steps": [{
         "id": "kvm_host_screen_query_capture",
         "uri": "kvm://host/screen/query/capture",
@@ -286,7 +335,16 @@ def test_recalled_all_monitors_flow_rebinds_to_specific_monitor():
 
     repaired = prepare_screenshot_capture_flow(recalled, "zrob zrzut 3 ekranu monitora", set())
 
-    assert repaired["steps"][0]["payload"] == {"monitor": 3, "scope": ""}
+    # scope:all survives (not cleared) so the gate can still see it.
+    assert repaired["steps"][0]["payload"].get("scope") == "all"
+
+    routes = [{"uri": "kvm://host/screen/query/capture", "node": "host", "meta": {"contract": {
+        "domains": {"monitor": {"type": "enum", "domain": "env:monitors.id",
+                                "skipWhen": {"scope": ["all", "all-monitors", "desktop"]}}}}}}]
+    inventories = {"host": {"domains": {"env:monitors.id": [{"value": 1}, {"value": 2}, {"value": 3}]}}}
+    verdict = recall_env_enum_replan_required(repaired, routes, inventories)
+    assert verdict["required"] is True
+    assert verdict["reason"] == "skip-when"
 
 
 def test_generic_screenshot_prompt_does_not_bind_a_monitor():

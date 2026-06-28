@@ -371,6 +371,63 @@ def _step_is_infeasible(uri: str, infeasible_constraints: list[dict]) -> dict | 
 
 # ── Flow normalization ────────────────────────────────────────────────────────
 
+def _schema_placeholder(schema: dict) -> object:
+    """Return a minimal value that satisfies the common scalar schema shapes.
+
+    Flow payloads may contain ``<param>_from`` references that are resolved at
+    execution time. For contract validation they stand in for the target
+    connector parameter, so the validator needs a typed placeholder rather than
+    the DSL key itself.
+    """
+    if not isinstance(schema, dict):
+        return None
+    if schema.get("enum"):
+        return schema["enum"][0]
+    if isinstance(schema.get("const"), (str, int, float, bool)) or schema.get("const") is None:
+        if "const" in schema:
+            return schema.get("const")
+    if schema.get("anyOf"):
+        return _schema_placeholder(schema["anyOf"][0])
+    if schema.get("oneOf"):
+        return _schema_placeholder(schema["oneOf"][0])
+    typ = schema.get("type")
+    if isinstance(typ, list):
+        typ = next((t for t in typ if t != "null"), typ[0] if typ else None)
+    if typ == "integer":
+        return 0
+    if typ == "number":
+        return 0
+    if typ == "boolean":
+        return False
+    if typ == "array":
+        return []
+    if typ == "object":
+        return {}
+    return ""
+
+
+def _payload_for_schema_validation(payload: dict, schema: dict) -> dict:
+    """Translate flow-level result references into connector-level fields.
+
+    ``monitor_from: "step.result.value.selected.monitor"`` is valid flow DSL
+    when the connector declares a ``monitor`` input. Unknown ``*_from`` keys are
+    left untouched so strict schemas still reject them.
+    """
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict):
+        return payload
+    literal_from_keys = {"copy_from"}
+    out: dict = {}
+    for key, value in (payload or {}).items():
+        if key.endswith("_from") and key not in literal_from_keys and isinstance(value, str):
+            base = key[: -len("_from")]
+            if base in props:
+                out[base] = _schema_placeholder(props.get(base) or {})
+                continue
+        out[key] = value
+    return out
+
+
 def _validate_step_payload(uri: str, payload: dict, routes: "list[dict] | None") -> None:
     """Raise ValueError when routes include an inputSchema that payload doesn't satisfy."""
     if not routes:
@@ -379,8 +436,10 @@ def _validate_step_payload(uri: str, payload: dict, routes: "list[dict] | None")
     if not (route and route.get("inputSchema")):
         return
     import jsonschema  # noqa: PLC0415
+    schema = route["inputSchema"]
+    validation_payload = _payload_for_schema_validation(payload, schema)
     try:
-        jsonschema.validate(instance=payload, schema=route["inputSchema"])
+        jsonschema.validate(instance=validation_payload, schema=schema)
     except jsonschema.ValidationError as e:
         raise ValueError(f"Payload validation failed for {uri}: {e.message}")
 
@@ -567,14 +626,11 @@ def _apply_screenshot_capture_payload(steps: list[dict], prompt: str) -> list[di
         if _is_screen_capture_step(new_step):
             payload = dict(new_step.get("payload") or {})
             payload.update(payload_hint)
-            # A specific monitor must win over a recalled all-desktop scope. The kvm capture
-            # contract skips `monitor` when scope is all/all-monitors/desktop, so a recalled
-            # {scope: all} would silently ignore the freshly-bound monitor index — exactly the
-            # "asked for monitor 3, got all monitors" recall bug. Clear the conflicting scope.
-            hinted = payload_hint.get("monitor")
-            if isinstance(hinted, int) and hinted >= 1 and \
-                    str(payload.get("scope") or "") in {"all", "all-monitors", "desktop"}:
-                payload["scope"] = ""
+            # Deliberately do NOT clear a recalled all-desktop scope here. A recalled
+            # {scope: all} must keep its scope so the env-enum recall gate
+            # (urirun_flow.env_selection.recall_env_enum_replan_required) detects the skipWhen
+            # and routes the flow to retrieve→propose, rather than this layer silently
+            # re-binding a remembered episode. Similarity proposes; the gate admits.
             new_step["payload"] = payload
         out.append(new_step)
     return out
