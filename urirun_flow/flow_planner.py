@@ -425,6 +425,57 @@ def _normalize_flow_task(task: dict) -> dict:
     }
 
 
+_WINDOW_LIST_SUFFIX = "/window/query/list"
+_SCREEN_CAPTURE_SUFFIX = "/screen/query/capture"
+
+
+def _positive_int(value: object) -> bool:
+    try:
+        return int(value) > 0
+    except Exception:
+        return False
+
+
+def _capture_needs_window_monitor(payload: dict) -> bool:
+    if "monitor_from" in payload:
+        return False
+    if _positive_int(payload.get("monitor")):
+        return False
+    scope = str(payload.get("scope") or "").strip().lower()
+    return scope in {"", "all", "all-monitors", "desktop"} or payload.get("monitor") in (None, "", 0, -1)
+
+
+def _bind_window_monitor_capture(steps: list[dict]) -> list[dict]:
+    """Bind window-list results into later screen capture monitor payloads.
+
+    LLMs often propose the right observation step (`window/query/list`) but leave
+    the capture as `scope: all`. The deterministic flow normalizer wires the data
+    dependency without inferring app names from text: the window query owns window
+    selection, and capture consumes `selected.monitor`.
+    """
+    out: list[dict] = []
+    latest_window_step: dict | None = None
+    for step in steps:
+        uri = str(step.get("uri") or "")
+        if uri.endswith(_WINDOW_LIST_SUFFIX):
+            latest_window_step = step
+            out.append(step)
+            continue
+        if uri.endswith(_SCREEN_CAPTURE_SUFFIX) and latest_window_step is not None:
+            payload = dict(step.get("payload") or {})
+            if _capture_needs_window_monitor(payload):
+                payload.pop("scope", None)
+                if not _positive_int(payload.get("monitor")):
+                    payload.pop("monitor", None)
+                payload["monitor_from"] = f"{latest_window_step['id']}.result.value.selected.monitor"
+                deps = list(step.get("depends_on") or [])
+                if latest_window_step["id"] not in deps:
+                    deps.append(latest_window_step["id"])
+                step = {**step, "payload": payload, "depends_on": deps}
+        out.append(step)
+    return out
+
+
 # ── CDP probe injection ───────────────────────────────────────────────────────
 
 _CDP_ENSURE_SUFFIX = "/cdp/session/command/ensure"
@@ -491,6 +542,15 @@ def _screenshot_capture_payload(prompt: str) -> dict:
     m = re.search(r"\bnumer\s+(\d+)\s+monitor(?:ze|a|ow)?\b", low)
     if m:
         return {"monitor": max(1, int(m.group(1)))}
+    # A monitor index NL placed next to "ekran" (screen) rather than directly next to
+    # "monitor" — e.g. "zrob zrzut 3 ekranu monitora" or "ekranu 3 monitora". Anchored on the
+    # word "monitor" so a generic screenshot phrase ("zrob zrzut ekranu") never matches.
+    m = re.search(r"\b(\d+)\s+ekran\w*\s+monitor\w*\b", low)
+    if m:
+        return {"monitor": max(1, int(m.group(1)))}
+    m = re.search(r"\bekran\w*\s+(\d+)\s+monitor\w*\b", low)
+    if m:
+        return {"monitor": max(1, int(m.group(1)))}
     for word, number in _MONITOR_ORDINALS.items():
         if re.search(rf"\b{re.escape(word)}\s+monitor\b|\bmonitor\s+{re.escape(word)}\b", low):
             return {"monitor": number}
@@ -507,6 +567,14 @@ def _apply_screenshot_capture_payload(steps: list[dict], prompt: str) -> list[di
         if _is_screen_capture_step(new_step):
             payload = dict(new_step.get("payload") or {})
             payload.update(payload_hint)
+            # A specific monitor must win over a recalled all-desktop scope. The kvm capture
+            # contract skips `monitor` when scope is all/all-monitors/desktop, so a recalled
+            # {scope: all} would silently ignore the freshly-bound monitor index — exactly the
+            # "asked for monitor 3, got all monitors" recall bug. Clear the conflicting scope.
+            hinted = payload_hint.get("monitor")
+            if isinstance(hinted, int) and hinted >= 1 and \
+                    str(payload.get("scope") or "") in {"all", "all-monitors", "desktop"}:
+                payload["scope"] = ""
             new_step["payload"] = payload
         out.append(new_step)
     return out
@@ -815,6 +883,7 @@ def normalize_flow(flow: dict, allowed_uris: set[str], routes: list[dict] | None
     steps = _strip_focus_from_cdp_flows(steps)
     steps = _rewrite_cdp_profile_for_auth(steps)
     steps = _inject_cdp_ready_probes(steps, allowed_uris, used, routes=routes)
+    steps = _bind_window_monitor_capture(steps)
     return {"task": _normalize_flow_task(task), "steps": steps}
 
 
@@ -917,6 +986,7 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
                 "GATE VERIFY: when a verify step checks for login/presence of a UI element that is REQUIRED for the next action (e.g. 'Zacznij publikację' before clicking Publish), add {\"required\": true} to the verify payload — this fails the flow early when not logged in, instead of continuing into failing click steps. "
                 "LOGIN PROFILE: when the task requires being logged in to a service (LinkedIn, Google, GitHub…), set {\"copy_from\": \"~/.config/google-chrome\"} (the user-data-dir ROOT, not the Default subdir) in the cdp/session/command/ensure payload — this CLONES the saved session cookies into a dedicated CDP profile so Chrome opens already logged in WITHOUT fighting the live profile's lock. Do NOT set user_data_dir to the live profile (it launches over the SingletonLock and copies no cookies → login wall); never use an empty or temp profile for tasks that require authentication. "
                 "SCREENSHOT RULE: when the request contains 'screenshot', 'zrzut ekranu', 'capture', 'snap' or similar, the LAST step MUST be screen/query/capture — ALWAYS, regardless of login state, page content, or what verify found. Never substitute a log note for a screenshot step. "
+                "WINDOW-MONITOR RULE: when the request asks for the monitor/screen that contains a named app/window/browser, first use window/query/list with the app or title field grounded from the request, then make screen/query/capture depend on that step and set monitor_from to '<window_step_id>.result.value.selected.monitor'. Do not use scope:'all' for a single-monitor request tied to an app/window. "
                 # Concrete-state grounding: when an 'environments' field is present it is the LIVE
                 # capability profile + foreground surface of each node — GROUND your steps on it:
                 "honour each node's 'bestSurface' and ALL items in its 'guidance' list (they are "

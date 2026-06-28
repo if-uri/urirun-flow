@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from urirun_flow.env_selection import resolve_env_enums
+from urirun_flow.env_selection import recall_env_enum_replan_required, resolve_env_enums
 
 
 ROUTE = "kvm://host/screen/query/capture"
@@ -37,6 +37,17 @@ def test_explicit_env_enum_value_wins():
     assert res["decisions"][0]["source"] == "explicit"
 
 
+def test_invalid_explicit_env_enum_value_is_rejected():
+    res = resolve_env_enums(_flow({"monitor": 99}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]))
+
+    assert res["ok"] is False
+    assert res["kind"] == "env-domain-invalid"
+    assert res["violation"]["allowed"] == [1, 2]
+
+
 def test_single_option_is_selected_without_prompting():
     res = resolve_env_enums(_flow(), ROUTES, _inventory([
         {"value": 1, "label": "primary"},
@@ -63,6 +74,20 @@ def test_remembered_value_is_fingerprint_keyed():
     assert res["decisions"][0]["source"] == "remembered"
 
 
+def test_result_reference_defers_env_enum_until_execution():
+    res = resolve_env_enums(
+        _flow({"monitor_from": "list_windows.result.value.selected.monitor"}),
+        ROUTES,
+        _inventory([
+            {"value": 1, "label": "HDMI-1"},
+            {"value": 2, "label": "DP-2"},
+        ]),
+    )
+
+    assert res["ok"] is True
+    assert res["decisions"][0]["source"] == "result-ref"
+
+
 def test_multiple_options_without_memory_emits_needs_selection():
     res = resolve_env_enums(_flow(), ROUTES, _inventory([
         {"value": 1, "label": "HDMI-1"},
@@ -83,3 +108,34 @@ def test_skip_when_scope_all_does_not_ask_for_monitor():
 
     assert res["ok"] is True
     assert res["flow"]["steps"][0]["payload"] == {"scope": "all", "monitor": -1}
+    assert res["decisions"][0]["source"] == "skip"
+
+
+def test_recalled_scope_all_requires_replan_when_domain_has_multiple_options():
+    res = recall_env_enum_replan_required(
+        _flow({"scope": "all", "monitor": -1}),
+        ROUTES,
+        _inventory([
+            {"value": 1, "label": "HDMI-1"},
+            {"value": 2, "label": "DP-2"},
+            {"value": 3, "label": "DP-1"},
+        ]),
+    )
+
+    assert res["required"] is True
+    assert res["reason"] == "skip-when"
+    assert res["parameter"] == "monitor"
+
+
+def test_recalled_concrete_valid_env_enum_can_shortcut():
+    res = recall_env_enum_replan_required(
+        _flow({"monitor": 3}),
+        ROUTES,
+        _inventory([
+            {"value": 1, "label": "HDMI-1"},
+            {"value": 2, "label": "DP-2"},
+            {"value": 3, "label": "DP-1"},
+        ]),
+    )
+
+    assert res["required"] is False

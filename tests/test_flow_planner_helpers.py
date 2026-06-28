@@ -16,7 +16,7 @@ from urirun_flow.flow import (
     _uri_matches_template,
     _uri_segments,
 )
-from urirun_flow.flow_planner import heuristic_flow, make_flow, prepare_screenshot_capture_flow
+from urirun_flow.flow_planner import heuristic_flow, make_flow, normalize_flow, prepare_screenshot_capture_flow
 
 
 # ─── first_url ───────────────────────────────────────────────────────────────
@@ -118,6 +118,39 @@ def test_json_from_text_fenced():
 def test_json_from_text_embedded():
     text = "Here is the flow: {\"ok\": true} done."
     assert json_from_text(text)["ok"] is True
+
+
+def test_normalize_binds_window_list_monitor_into_capture():
+    allowed = {
+        "kvm://host/window/query/list",
+        "kvm://host/screen/query/capture",
+    }
+    flow = {
+        "task": {"id": "shot"},
+        "steps": [
+            {
+                "id": "list_windows",
+                "uri": "kvm://host/window/query/list",
+                "payload": {"app": "chrome"},
+                "depends_on": [],
+            },
+            {
+                "id": "capture_monitor",
+                "uri": "kvm://host/screen/query/capture",
+                "payload": {"monitor": -1, "scope": "all", "output": "chrome_monitor.png"},
+                "depends_on": [],
+            },
+        ],
+    }
+
+    normalized = normalize_flow(flow, allowed)
+    capture = normalized["steps"][1]
+
+    assert capture["depends_on"] == ["list_windows"]
+    assert capture["payload"]["monitor_from"] == "list_windows.result.value.selected.monitor"
+    assert capture["payload"]["output"] == "chrome_monitor.png"
+    assert "scope" not in capture["payload"]
+    assert "monitor" not in capture["payload"]
 
 
 # ─── screenshot capture repair ──────────────────────────────────────────────
@@ -226,6 +259,46 @@ def test_explicit_monitor_number_after_numer_is_kept_one_based():
     )
 
     assert repaired["steps"][0]["payload"] == {"monitor": 3}
+
+
+def test_monitor_index_via_ekran_phrasing_is_extracted():
+    # "zrob zrzut 3 ekranu monitora" — the digit is separated from "monitor" by "ekranu",
+    # so the bare-number patterns miss it; anchored on "monitor" so it cannot false-positive.
+    repaired = prepare_screenshot_capture_flow(
+        {"steps": []},
+        "zrob zrzut 3 ekranu  monitora",
+        {"kvm://host/screen/query/capture"},
+    )
+
+    assert repaired["steps"][0]["payload"] == {"monitor": 3}
+
+
+def test_recalled_all_monitors_flow_rebinds_to_specific_monitor():
+    # The recall bug: a remembered episode replayed {monitor: -1, scope: "all"} verbatim and
+    # captured ALL monitors even though the new prompt asked for monitor 3. The fresh monitor
+    # index must win, and the conflicting all-desktop scope must be cleared (the kvm contract
+    # skips `monitor` when scope is all/all-monitors/desktop).
+    recalled = {"steps": [{
+        "id": "kvm_host_screen_query_capture",
+        "uri": "kvm://host/screen/query/capture",
+        "payload": {"monitor": -1, "scope": "all"},
+    }]}
+
+    repaired = prepare_screenshot_capture_flow(recalled, "zrob zrzut 3 ekranu monitora", set())
+
+    assert repaired["steps"][0]["payload"] == {"monitor": 3, "scope": ""}
+
+
+def test_generic_screenshot_prompt_does_not_bind_a_monitor():
+    # "zrob zrzut ekranu" is the everyday phrase for "take a screenshot" — it must not be
+    # misread as a monitor index by the new ekran-anchored pattern.
+    repaired = prepare_screenshot_capture_flow(
+        {"steps": []},
+        "zrob zrzut ekranu",
+        {"kvm://host/screen/query/capture"},
+    )
+
+    assert "monitor" not in repaired["steps"][0]["payload"]
 
 
 def test_heuristic_flow_uses_kvm_capture_for_screen_prompt_without_llm():

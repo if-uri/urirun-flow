@@ -7,6 +7,7 @@ concrete payload or a typed ``needs-selection`` request.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -63,6 +64,10 @@ def _has_explicit(payload: dict, param: str, cfg: dict) -> bool:
     return payload.get(param) not in empty
 
 
+def _has_result_reference(payload: dict, param: str) -> bool:
+    return isinstance(payload.get(f"{param}_from"), str) and bool(str(payload.get(f"{param}_from")).strip())
+
+
 def _preference_value(memory: Any, node: str, cfg: dict, param: str, fingerprint: str) -> Any:
     if memory is None or not hasattr(memory, "recall_preference"):
         return None
@@ -78,6 +83,37 @@ def _preference_value(memory: Any, node: str, cfg: dict, param: str, fingerprint
 
 def _option_values(options: list[dict]) -> set:
     return {opt.get("value") for opt in options}
+
+
+def _value_key(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"-?\d+", text):
+            return int(text)
+        return text.lower()
+    return value
+
+
+def _option_value_keys(options: list[dict]) -> set[Any]:
+    return {_value_key(opt.get("value")) for opt in options}
+
+
+def _env_domain_invalid(uri: str, node: str, param: str, cfg: dict, value: Any,
+                        options: list[dict]) -> dict:
+    return {
+        "ok": False,
+        "kind": "env-domain-invalid",
+        "violation": {
+            "kind": "env-domain-invalid",
+            "uri": uri,
+            "node": node,
+            "parameter": param,
+            "domain": cfg.get("domain"),
+            "value": value,
+            "allowed": [opt.get("value") for opt in options],
+        },
+        "next": {"kind": "replan", "reason": "env-domain-invalid"},
+    }
 
 
 def _needs_selection(uri: str, node: str, param: str, cfg: dict,
@@ -99,6 +135,51 @@ def _needs_selection(uri: str, node: str, param: str, cfg: dict,
     }
 
 
+def recall_env_enum_replan_required(flow: dict, routes: list[dict],
+                                    inventories: dict[str, dict] | list[dict] | None) -> dict:
+    """Return why a recalled flow must be treated as a proposal, not a shortcut.
+
+    A remembered flow is safe to replay only when contract-declared env-enum
+    parameters are already concrete and valid for the current inventory. If a
+    recalled step bypasses the enum via ``skipWhen`` (for example ``scope: all``),
+    leaves it unresolved, or carries a value outside the current domain, the LLM
+    gets that flow through retrieval and must propose a fresh candidate.
+    """
+    for step in flow.get("steps") or []:
+        uri = str(step.get("uri") or "")
+        payload = dict(step.get("payload") or {})
+        node = _target(uri)
+        inventory = _inventory_for(node, inventories)
+        for param, cfg in _route_domains(uri, routes).items():
+            if not isinstance(cfg, dict) or cfg.get("type") != "enum" or not cfg.get("domain"):
+                continue
+            options = _domain_options(inventory, str(cfg["domain"]))
+            if len(options) <= 1:
+                continue
+            reason = ""
+            if _skip_by_payload(payload, cfg):
+                reason = "skip-when"
+            elif _has_result_reference(payload, str(param)):
+                continue
+            elif not _has_explicit(payload, str(param), cfg):
+                reason = "unresolved"
+            elif _value_key(payload.get(param)) not in _option_value_keys(options):
+                reason = "invalid"
+            if reason:
+                return {
+                    "required": True,
+                    "reason": reason,
+                    "uri": uri,
+                    "node": node,
+                    "parameter": str(param),
+                    "domain": cfg.get("domain"),
+                    "value": payload.get(param),
+                    "optionCount": len(options),
+                    "allowed": [opt.get("value") for opt in options],
+                }
+    return {"required": False}
+
+
 def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dict] | list[dict],
                       memory: Any = None) -> dict:
     """Return ``{ok, flow, decisions}`` or ``needs-selection`` for unresolved env enums."""
@@ -113,10 +194,19 @@ def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dic
         for param, cfg in domains.items():
             if not isinstance(cfg, dict) or cfg.get("type") != "enum" or not cfg.get("domain"):
                 continue
-            if _skip_by_payload(payload, cfg) or _has_explicit(payload, param, cfg):
-                decisions.append({"uri": uri, "parameter": param, "source": "explicit"})
+            if _skip_by_payload(payload, cfg):
+                decisions.append({"uri": uri, "parameter": param, "source": "skip"})
+                continue
+            if _has_result_reference(payload, str(param)):
+                decisions.append({"uri": uri, "parameter": param, "source": "result-ref",
+                                  "from": payload.get(f"{param}_from")})
                 continue
             options = _domain_options(inventory, str(cfg["domain"]))
+            if _has_explicit(payload, param, cfg):
+                if options and _value_key(payload.get(param)) not in _option_value_keys(options):
+                    return {**_env_domain_invalid(uri, node, param, cfg, payload.get(param), options), "flow": flow}
+                decisions.append({"uri": uri, "parameter": param, "source": "explicit"})
+                continue
             if len(options) == 1:
                 payload[param] = options[0]["value"]
                 decisions.append({"uri": uri, "parameter": param, "source": "single",
