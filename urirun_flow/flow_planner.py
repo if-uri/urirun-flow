@@ -458,21 +458,118 @@ def _inject_capture_if_needed(flow: dict, prompt: str, allowed_uris: set[str]) -
     if not any(kw in low for kw in _SCREENSHOT_KWS):
         return flow
     steps = list(flow.get("steps") or [])
-    if any("screen/query/capture" in str(s.get("uri") or "") for s in steps):
-        return flow
+    steps = _prepare_capture_after_required_verify(steps)
+    if any(_is_screen_capture_step(s) for s in steps):
+        return {**flow, "steps": steps}
     capture_uri = next(
         (u for u in sorted(allowed_uris) if "screen/query/capture" in u), None
     )
     if not capture_uri:
-        return flow
-    last_id = steps[-1]["id"] if steps else None
+        return {**flow, "steps": steps}
+    deps = _capture_dependency_ids(steps)
     steps.append({
         "id": "capture_screen",
         "uri": capture_uri,
         "payload": {},
-        "depends_on": [last_id] if last_id else [],
+        "depends_on": deps,
     })
+    steps = _prepare_capture_after_required_verify(steps)
     return {**flow, "steps": steps}
+
+
+def prepare_screenshot_capture_flow(flow: dict, prompt: str, allowed_uris: set[str] | None = None) -> dict:
+    """Normalize screenshot flows so capture is not blocked by an informational verify gate.
+
+    Recalled episodes can contain an old shape where ``screen/query/capture`` depends on a
+    required ``ui/query/verify``. If the page text changed or the user is on an authwall, that
+    verify aborts before the screenshot is taken, despite the user asking for evidence of the
+    current browser state. Screenshot flows should capture the state after navigation/page-ready;
+    a page-presence verify may remain as optional telemetry.
+    """
+    return _inject_capture_if_needed(flow, prompt, allowed_uris or set())
+
+
+def _is_screen_capture_step(step: dict) -> bool:
+    return "screen/query/capture" in str((step or {}).get("uri") or "")
+
+
+def _is_required_verify_step(step: dict | None) -> bool:
+    if not isinstance(step, dict):
+        return False
+    payload = step.get("payload") if isinstance(step.get("payload"), dict) else {}
+    return "/ui/query/verify" in str(step.get("uri") or "") and payload.get("required") is True
+
+
+def _is_nonblocking_screenshot_tail(step: dict) -> bool:
+    uri = str(step.get("uri") or "")
+    if _is_screen_capture_step(step):
+        return True
+    if "/query/" in uri:
+        return True
+    return uri.endswith("/input/command/wait")
+
+
+def _dedupe_ids(ids: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in ids:
+        if item and item not in seen:
+            out.append(item)
+            seen.add(item)
+    return out
+
+
+def _bypass_required_verify_deps(deps: list[str], by_id: dict[str, dict], seen: set[str] | None = None) -> list[str]:
+    seen = seen or set()
+    out: list[str] = []
+    for dep in deps:
+        if dep in seen:
+            continue
+        seen.add(dep)
+        gate = by_id.get(dep)
+        if _is_required_verify_step(gate):
+            out.extend(_bypass_required_verify_deps(list(gate.get("depends_on") or []), by_id, seen))
+        else:
+            out.append(dep)
+    return _dedupe_ids(out)
+
+
+def _capture_dependency_ids(steps: list[dict]) -> list[str]:
+    if not steps:
+        return []
+    by_id = {str(s.get("id")): s for s in steps if s.get("id")}
+    last_id = str(steps[-1].get("id") or "")
+    return _bypass_required_verify_deps([last_id], by_id)
+
+
+def _required_verify_only_blocks_capture(index: int, steps: list[dict]) -> bool:
+    for later in steps[index + 1:]:
+        if _is_screen_capture_step(later):
+            return True
+        if not _is_nonblocking_screenshot_tail(later):
+            return False
+    return False
+
+
+def _make_verify_optional(step: dict) -> dict:
+    payload = dict(step.get("payload") or {})
+    payload["required"] = False
+    return {**step, "payload": payload, "optional": True}
+
+
+def _prepare_capture_after_required_verify(steps: list[dict]) -> list[dict]:
+    if not steps:
+        return []
+    by_id = {str(s.get("id")): s for s in steps if s.get("id")}
+    out: list[dict] = []
+    for index, step in enumerate(steps):
+        new_step = dict(step)
+        if _is_screen_capture_step(new_step):
+            new_step["depends_on"] = _bypass_required_verify_deps(list(new_step.get("depends_on") or []), by_id)
+        elif _is_required_verify_step(new_step) and _required_verify_only_blocks_capture(index, steps):
+            new_step = _make_verify_optional(new_step)
+        out.append(new_step)
+    return out
 
 
 def _inject_cdp_ready_probes(steps: list[dict], allowed_uris: set[str],
