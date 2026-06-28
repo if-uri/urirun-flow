@@ -60,6 +60,7 @@ from urirun_flow.recovery import (
     step_target,
 )
 from urirun_connector_router.routing import (
+    accept_plan as accept_routing_plan,
     diagnose_plan as diagnose_routing_plan,
     execution_layers as routing_execution_layers,
     registry_from_routes,
@@ -119,6 +120,7 @@ from .flow_planner import (
     _DEFAULT_LOG_LIMIT,
     _PROCESS_LIST_LIMIT,
     _INTENT_NAMES,
+    _prepare_capture_after_required_verify,
     _CDP_ENSURE_SUFFIX,
     _CDP_READY_SUFFIX,
     _CDP_PAGE_PREFIX,
@@ -446,6 +448,134 @@ def _restore_service_map(old: str | None) -> None:
         os.environ["URI_SERVICE_MAP"] = old
 
 
+def _call_route_value(uri: str, payload: dict, registry: dict) -> dict:
+    try:
+        env = v2_service.call(uri, payload or {}, registry, mode="execute")
+        if isinstance(env, dict) and env.get("ok") is False:
+            return {}
+        val = result_data(env)
+        return val if isinstance(val, dict) else {}
+    except Exception:  # noqa: BLE001 - inventory is advisory; missing routes become empty sections.
+        return {}
+
+
+def _local_kvm_value(fn_name: str) -> dict:
+    try:
+        from urirun_connector_kvm import core as kvm_core  # noqa: PLC0415
+        fn = getattr(kvm_core, fn_name)
+        val = fn()
+        return val if isinstance(val, dict) and val.get("ok", True) else {}
+    except Exception:  # noqa: BLE001 - host-local KVM is an optional fallback.
+        return {}
+
+
+def _monitor_inventory(monitors: list[dict], display: dict) -> list[dict]:
+    out: list[dict] = []
+    for index, mon in enumerate(monitors or [], start=1):
+        if not isinstance(mon, dict):
+            continue
+        connector = str(mon.get("connector") or mon.get("name") or mon.get("displayName") or "")
+        label = connector or f"monitor {index}"
+        width = mon.get("logicalWidth") or mon.get("width")
+        height = mon.get("logicalHeight") or mon.get("height")
+        item = {
+            "id": index,
+            "label": label,
+            "connector": connector or None,
+            "primary": bool(mon.get("primary")),
+            "geometry": {
+                "x": int(mon.get("x") or 0),
+                "y": int(mon.get("y") or 0),
+                "width": int(width or 0),
+                "height": int(height or 0),
+            },
+        }
+        if mon.get("scale") is not None:
+            item["scale"] = mon.get("scale")
+        out.append(item)
+    if not out and (display.get("width") or display.get("height")):
+        out.append({
+            "id": 1,
+            "label": "primary",
+            "connector": None,
+            "primary": True,
+            "geometry": {
+                "x": 0,
+                "y": 0,
+                "width": int(display.get("width") or 0),
+                "height": int(display.get("height") or 0),
+            },
+        })
+    return out
+
+
+def _cdp_endpoint_inventory(browser_sessions: dict) -> list[dict]:
+    out: list[dict] = []
+    for entry in browser_sessions.get("browsers") or []:
+        if not isinstance(entry, dict) or not entry.get("cdp_port"):
+            continue
+        port = int(entry["cdp_port"])
+        out.append({
+            "id": f"127.0.0.1:{port}",
+            "endpoint": f"http://127.0.0.1:{port}",
+            "browser": entry.get("browser"),
+            "profile": entry.get("profile"),
+            "running": bool(entry.get("running")),
+            "throwaway": bool(entry.get("throwaway")),
+        })
+    return out
+
+
+def _build_env_inventory(node: str, registry: dict) -> dict:
+    from urirun.node.twin_store import environment_fingerprint  # noqa: PLC0415
+
+    profile = _call_route_value(f"kvm://{node}/env/query/profile", {}, registry)
+    display = _call_route_value(f"kvm://{node}/display/query/info", {}, registry)
+    browsers = _call_route_value(f"kvm://{node}/browser/query/sessions", {}, registry)
+    if node == "host":
+        profile = profile or _local_kvm_value("env_profile")
+        display = display or _local_kvm_value("display_info")
+        browsers = browsers or _local_kvm_value("browser_sessions")
+    monitors = _monitor_inventory(display.get("monitors") or profile.get("monitors") or [], display)
+    fingerprint_profile = {
+        **profile,
+        "display": {
+            "width": display.get("width"),
+            "height": display.get("height"),
+            "fullSize": display.get("fullSize"),
+        },
+        "monitors": monitors,
+    }
+    domains = {
+        "env:monitors.id": [
+            {
+                "value": mon["id"],
+                "label": mon["label"],
+                "primary": mon["primary"],
+                "geometry": mon["geometry"],
+                **({"connector": mon["connector"]} if mon.get("connector") else {}),
+            }
+            for mon in monitors
+        ],
+        "env:cdp_endpoints.id": [
+            {"value": ep["id"], "label": ep["endpoint"], "browser": ep.get("browser")}
+            for ep in _cdp_endpoint_inventory(browsers)
+        ],
+        "env:audio_sinks.id": [],
+        "env:cameras.id": [],
+    }
+    return {
+        "node": node,
+        "fingerprint": environment_fingerprint(fingerprint_profile),
+        "profile": profile,
+        "monitors": monitors,
+        "cdp_endpoints": _cdp_endpoint_inventory(browsers),
+        "audio_sinks": [],
+        "cameras": [],
+        "domains": domains,
+        "next": {"kind": "continue"},
+    }
+
 
 def _make_memory_dispatch(base_dispatch, memory: TwinMemory, flow: dict, registry: dict):
     """Wrap dispatch_uri to handle Twin memory operations in-process.
@@ -483,6 +613,10 @@ def _make_memory_dispatch(base_dispatch, memory: TwinMemory, flow: dict, registr
                 result["drift"] = dr
             return result
 
+        if "/env/query/inventory" in uri:
+            node = payload.get("node") or route_target(uri) or "host"
+            return {"ok": True, **_build_env_inventory(node, registry)}
+
         if "/memory/command/remember" in uri:
             nodes = payload.get("nodes") or []
             for node in nodes:
@@ -507,6 +641,7 @@ def _make_memory_dispatch(base_dispatch, memory: TwinMemory, flow: dict, registr
 
 
 _THIN_DRIFT_SUFFIX = "/env/query/drift"
+_THIN_INVENTORY_SUFFIX = "/env/query/inventory"
 _THIN_REMEMBER_URI = "twin://host/memory/command/remember"
 
 
@@ -559,6 +694,14 @@ def _drift_steps_for(kvm_targets: list[str], routes_list: list) -> list[dict]:
     ]
 
 
+def _inventory_steps_for(kvm_targets: list[str], routes_list: list) -> list[dict]:
+    return [
+        {"id": f"twin:inventory:{t}", "uri": f"twin://{t}{_THIN_INVENTORY_SUFFIX}",
+         "payload": {"node": t, "routes": routes_list}, "depends_on": [], "optional": True}
+        for t in kvm_targets
+    ]
+
+
 def _build_thin_plan(steps: list[dict], flow: dict, *, execute: bool,
                      memory: "TwinMemory | None" = None,
                      routes: list[dict] | None = None) -> list[dict]:
@@ -590,7 +733,12 @@ def _build_thin_plan(steps: list[dict], flow: dict, *, execute: bool,
                     "record": _thin_remember_record(flow, kvm_targets)},
         "depends_on": [], "optional": True,
     }
-    return _drift_steps_for(kvm_targets, routes_list) + plan + [remember_step]
+    return (
+        _drift_steps_for(kvm_targets, routes_list)
+        + _inventory_steps_for(kvm_targets, routes_list)
+        + plan
+        + [remember_step]
+    )
 
 
 def _default_dispatch_uri(execute: bool, registry: dict):
@@ -622,14 +770,28 @@ def _flow_routing_report(flow: dict, mesh: dict, routes: list[dict], *, probe: b
     routing_mesh = {
         "nodes": (mesh or {}).get("nodes") or [],
         "routes": routes or [],
+        "inventories": (
+            (mesh or {}).get("inventories")
+            or (mesh or {}).get("inventory")
+            or (mesh or {}).get("envInventories")
+            or (mesh or {}).get("envInventory")
+            or {}
+        ),
     }
     try:
-        return diagnose_routing_plan(flow.get("steps") or [], routing_mesh, probe=probe)
+        verdict = accept_routing_plan(flow.get("steps") or [], routing_mesh, probe=probe)
+        report = dict(verdict.get("report") or {})
+        report["accepted"] = bool(verdict.get("accepted"))
+        report["violations"] = list(verdict.get("violations") or [])
+        report["ok"] = bool(verdict.get("accepted"))
+        return report
     except Exception as exc:  # noqa: BLE001 - report failure without changing flow execution semantics
         return {
             "ok": False,
+            "accepted": False,
             "stepCount": len(flow.get("steps") or []),
             "error": {"type": type(exc).__name__, "message": str(exc)},
+            "violations": [{"kind": "acceptance-error", "message": str(exc)}],
             "steps": [],
             "blockedSteps": [],
             "runsOnByStep": {},
@@ -653,10 +815,14 @@ def _routing_timeline(report: dict) -> list[dict]:
 
 def _routing_block_result(report: dict, envelope: "FlowEnvelope") -> dict:
     blocked = report.get("blockedSteps") or []
+    violations = report.get("violations") or []
     first = blocked[0] if blocked else {}
+    first_violation = violations[0] if violations else {}
     message = (
         f"routing blocked before execution at {first.get('blockedAt')}: {first.get('uri')}"
-        if first else "routing blocked before execution"
+        if first else
+        f"plan rejected before execution: {first_violation.get('kind')}"
+        if first_violation else "routing blocked before execution"
     )
     error = {
         "category": "ROUTING_BLOCKED",
@@ -671,6 +837,7 @@ def _routing_block_result(report: dict, envelope: "FlowEnvelope") -> dict:
         "results": {},
         "error": error,
         "routing": report,
+        "violations": violations,
         "next": {"kind": "blocked"},
         "envelope": dataclasses.asdict(envelope),
     }
@@ -702,6 +869,13 @@ def execute_flow(flow: dict, mesh: dict, registry: dict, execute: bool, *, recov
     # path is always used — no second engine, no silent fallback.
     if dispatch_uri is None:
         dispatch_uri = _default_dispatch_uri(execute, registry)
+    # Keep screen/query/capture reachable when a recalled or LLM-authored page-presence
+    # ui/query/verify (required) gates it: a Wayland-blank capture or auth-walled page must
+    # not block the screenshot itself. The planner already does this for freshly planned flows
+    # (flow_planner._inject_capture_if_needed); applying it here at the shared execution
+    # chokepoint covers the RECALL path too, which replays stored steps without re-planning.
+    # Idempotent + prompt-independent: a no-op unless a capture is gated by a required verify.
+    flow = {**flow, "steps": _prepare_capture_after_required_verify(flow.get("steps") or [])}
     envelope = _make_flow_envelope(flow, envelope)
     old_map = _set_service_map(mesh)
     try:
@@ -973,6 +1147,22 @@ def _uri_env_drift(payload: dict) -> dict:
     return result
 
 
+def _uri_env_inventory(payload: dict) -> dict:
+    """Handler for twin://<node>/env/query/inventory.
+
+    Returns structured degrees of freedom for the planner: monitor options,
+    browser/CDP endpoints and future device domains. This is separate from
+    drift: drift answers "did the known-good profile change?", inventory answers
+    "what concrete choices exist before dispatch?".
+    """
+    import urirun  # noqa: PLC0415
+
+    node = payload.get("node") or "host"
+    routes = payload.get("routes") or []
+    registry = registry_from_routes(routes)
+    return {**urirun.ok(action="env-inventory"), **_build_env_inventory(node, registry)}
+
+
 def _remember_node_profile(memory, node: str, registry: dict) -> None:
     try:
         prof_r = v2_service.call(f"kvm://{node}/env/query/profile",
@@ -1027,6 +1217,8 @@ try:
                        meta={"label": "Provision surfaces before the main flow loop"})(_uri_preflight)
     _flow_conn.handler("env/query/drift",
                        meta={"label": "Twin drift detection — compare live env to known-good baseline"})(_uri_env_drift)
+    _flow_conn.handler("env/query/inventory",
+                       meta={"label": "Twin environment inventory — monitors, endpoints and devices"})(_uri_env_inventory)
     _flow_conn.handler("memory/command/remember",
                        meta={"label": "Record known-good execution and advance env baseline"})(_uri_memory_remember)
 except Exception:  # noqa: BLE001 - connector registration is optional

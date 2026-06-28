@@ -178,6 +178,7 @@ def _append_target_steps(steps: list[dict], route_uris: set, target: str, intent
         )
     if intents["screen"]:
         previous = ensure_health(previous)
+        previous = append_if_available(steps, route_uris, f"kvm://{target}/screen/query/capture", {}, previous)
         previous = append_if_available(steps, route_uris, f"screen://{target}/portal/query/capture", {}, previous)
         previous = append_if_available(
             steps,
@@ -234,6 +235,11 @@ def heuristic_flow(prompt: str, routes: list[dict], nodes: list[dict], selected_
     selected_routes = [route for route in routes if safe_route(route) and selected_route(route)]
     route_uris = {route["uri"] for route in selected_routes}
     targets = route_targets_for_nodes(selected_routes, selected)
+    if not targets and not selected:
+        for route in selected_routes:
+            target = route_target(str(route.get("uri") or ""))
+            if target and target not in targets:
+                targets.append(target)
     lowered = nl_key(prompt)
     intents = _flow_intents(prompt, use_llm=use_llm)
     url = first_url(prompt) or ("https://www.linkedin.com/feed/" if "linkedin" in lowered else "https://example.com/")
@@ -449,6 +455,62 @@ _SCREENSHOT_KWS = frozenset({
     "screen grab", "capture screen", "snap screen",
 })
 
+_ALL_MONITOR_KWS = (
+    "all monitors", "all screens", "whole desktop", "entire desktop",
+    "wszystkie monitory", "wszystkich monitorow", "wszystkich monitorw",
+    "wszystkie ekrany", "caly pulpit", "calego pulpitu",
+)
+
+_MONITOR_ORDINALS = {
+    "pierwszy": 1, "pierwszego": 1, "first": 1,
+    "drugi": 2, "drugiego": 2, "second": 2,
+    "trzeci": 3, "trzeciego": 3, "third": 3,
+    "czwarty": 4, "czwartego": 4, "fourth": 4,
+}
+
+
+def _screenshot_capture_payload(prompt: str) -> dict:
+    """Derive capture-surface preferences from NL.
+
+    KVM keeps ``monitor=0`` as its legacy default. Explicit user monitor
+    numbers are stored 1-based (``monitor=2`` means "second monitor") so the
+    backend can distinguish them from the default primary-monitor path.
+    """
+    low = nl_key(prompt)
+    if any(kw in low for kw in _ALL_MONITOR_KWS):
+        return {"scope": "all", "monitor": -1}
+    m = re.search(r"\bmonitor(?:ze|a|ow)?\s*(\d+)\b", low)
+    if m:
+        return {"monitor": max(1, int(m.group(1)))}
+    m = re.search(r"\bmonitor(?:ze|a|ow)?\s+numer\s+(\d+)\b", low)
+    if m:
+        return {"monitor": max(1, int(m.group(1)))}
+    m = re.search(r"\b(\d+)\s+monitor(?:ze|a|ow)?\b", low)
+    if m:
+        return {"monitor": max(1, int(m.group(1)))}
+    m = re.search(r"\bnumer\s+(\d+)\s+monitor(?:ze|a|ow)?\b", low)
+    if m:
+        return {"monitor": max(1, int(m.group(1)))}
+    for word, number in _MONITOR_ORDINALS.items():
+        if re.search(rf"\b{re.escape(word)}\s+monitor\b|\bmonitor\s+{re.escape(word)}\b", low):
+            return {"monitor": number}
+    return {}
+
+
+def _apply_screenshot_capture_payload(steps: list[dict], prompt: str) -> list[dict]:
+    payload_hint = _screenshot_capture_payload(prompt)
+    if not payload_hint:
+        return steps
+    out: list[dict] = []
+    for step in steps:
+        new_step = dict(step)
+        if _is_screen_capture_step(new_step):
+            payload = dict(new_step.get("payload") or {})
+            payload.update(payload_hint)
+            new_step["payload"] = payload
+        out.append(new_step)
+    return out
+
 
 def _inject_capture_if_needed(flow: dict, prompt: str, allowed_uris: set[str]) -> dict:
     """Append screen/query/capture as the last step when the prompt asks for a screenshot
@@ -460,7 +522,8 @@ def _inject_capture_if_needed(flow: dict, prompt: str, allowed_uris: set[str]) -
     steps = list(flow.get("steps") or [])
     steps = _prepare_capture_after_required_verify(steps)
     if any(_is_screen_capture_step(s) for s in steps):
-        return {**flow, "steps": steps}
+        steps = _apply_screenshot_capture_payload(steps, prompt)
+        return {**flow, "steps": _prefer_browser_capture_scope_after_cdp(steps)}
     capture_uri = next(
         (u for u in sorted(allowed_uris) if "screen/query/capture" in u), None
     )
@@ -470,10 +533,11 @@ def _inject_capture_if_needed(flow: dict, prompt: str, allowed_uris: set[str]) -
     steps.append({
         "id": "capture_screen",
         "uri": capture_uri,
-        "payload": {},
+        "payload": _screenshot_capture_payload(prompt),
         "depends_on": deps,
     })
     steps = _prepare_capture_after_required_verify(steps)
+    steps = _prefer_browser_capture_scope_after_cdp(steps)
     return {**flow, "steps": steps}
 
 
@@ -491,6 +555,35 @@ def prepare_screenshot_capture_flow(flow: dict, prompt: str, allowed_uris: set[s
 
 def _is_screen_capture_step(step: dict) -> bool:
     return "screen/query/capture" in str((step or {}).get("uri") or "")
+
+
+def _is_cdp_step(step: dict | None) -> bool:
+    return isinstance(step, dict) and "/cdp/" in str(step.get("uri") or "")
+
+
+def _prefer_browser_capture_scope_after_cdp(steps: list[dict]) -> list[dict]:
+    """Mark screen captures after browser-CDP steps as browser-scoped.
+
+    On live GNOME/Wayland multi-monitor hosts, an OS-level capture can legally
+    return a monitor that does not contain the browser window. When the flow has
+    already driven a browser through CDP on the same target, the meaningful
+    screenshot is the active page viewport, so ask the KVM connector to prefer
+    CDP capture. Plain desktop screenshots remain unchanged.
+    """
+    seen_cdp_targets: set[str] = set()
+    out: list[dict] = []
+    for step in steps:
+        new_step = dict(step)
+        uri = str(new_step.get("uri") or "")
+        target = route_target(uri)
+        if _is_screen_capture_step(new_step) and target in seen_cdp_targets:
+            payload = dict(new_step.get("payload") or {})
+            payload.setdefault("scope", "browser")
+            new_step["payload"] = payload
+        out.append(new_step)
+        if _is_cdp_step(new_step):
+            seen_cdp_targets.add(target)
+    return out
 
 
 def _is_required_verify_step(step: dict | None) -> bool:
@@ -774,6 +867,7 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
             "kind": route.get("kind"),
             "title": route.get("title"),
             "inputSchema": route.get("inputSchema") or {"type": "object"},
+            "contract": (route.get("meta") or {}).get("contract") or route.get("contract") or {},
         }
         for route in routes
         if safe_route(route)
@@ -830,6 +924,12 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
                 "Check 'actionMatrix' per node: if an action's value for a surface is 'not_executable' "
                 "or 'blocked', do NOT plan that action on that surface — use the surface where the same "
                 "action is 'executable' instead (e.g. type → cdp only). "
+                "For any allowedRoute with contract.domains, ground payload parameters on the matching "
+                "environment domains. Example: if monitor declares domain env:monitors.id, use only values "
+                "from environments[].domains['env:monitors.id'] unless the user explicitly asks for an "
+                "unavailable value; in that case preserve the user's requested value so the deterministic "
+                "router can reject it with an actionable env-domain-invalid diagnostic. Do not guess hidden "
+                "monitor numbers or hard-code monitor labels. "
                 "Check 'sessionMap' per node: if the task involves a service (linkedin, google, github…) "
                 "and that service appears in sessionMap with running=false or throwaway=true or cdp_port=null, "
                 "the FIRST step must be cdp/session/command/ensure with copy_from set to the profile path "
@@ -1009,8 +1109,14 @@ def make_flow(prompt: str, mesh: dict, selected_nodes: list[str] | None = None, 
                 selected_nodes=selected_nodes,
                 environments=environments,
             )
-            return _inject_capture_if_needed(flow, prompt, allowed), {"provider": "litellm", "fallback": False}
-        except Exception as exc:  # noqa: BLE001 - host should still be usable without an LLM.
+            return flow, {"provider": "litellm", "fallback": False}
+        except Exception as exc:  # noqa: BLE001 - return a controlled planner error unless fallback is explicit.
+            if os.getenv("URIRUN_ALLOW_HEURISTIC_PLANNER_FALLBACK", "").strip().lower() not in {"1", "true", "yes"}:
+                raise RuntimeError(
+                    "LLM planner failed and heuristic fallback is disabled. "
+                    "Configure URIRUN_LLM_MODEL/LLM_MODEL, pass noLlm=true for explicit "
+                    "offline diagnostics, or set URIRUN_ALLOW_HEURISTIC_PLANNER_FALLBACK=1."
+                ) from exc
             flow = heuristic_flow(prompt, routes, mesh["nodes"], selected_nodes, use_llm=True)
             flow = normalize_flow_or_explain(
                 flow,

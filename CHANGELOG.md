@@ -7,7 +7,9 @@ All notable changes to **urirun-flow** ([Keep a Changelog](https://keepachangelo
 ### Changed
 - Screenshot flows now keep `screen/query/capture` reachable even when a recalled
   or LLM-generated page-presence `ui/query/verify` fails; the verify becomes
-  optional telemetry when it only gates the final capture.
+  optional telemetry when it only gates the final capture. The normalization runs
+  at the shared `execute_flow` chokepoint, so **recalled episodes** (which replay
+  stored steps without re-planning) get it too — not only freshly-planned flows.
 - Pure helper modules (`envelope`, `flow_thin`, `flow_verify`) no longer import the
   `urirun` hub runtime just to unwrap envelopes or resolve route targets.
 - Flow-local utility helpers (`now_id`, `slug`, `json_write`, `quiet_completion`)

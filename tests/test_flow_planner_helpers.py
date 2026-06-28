@@ -4,7 +4,11 @@ template matching, JSON extraction). These live with the flow package — they n
 helper coverage (the hub keeps the integration tests that exercise execution through the shim)."""
 from __future__ import annotations
 
+import pytest
+
 from urirun_flow.flow import (
+    _build_thin_plan,
+    _build_env_inventory,
     first_url,
     json_from_text,
     nl_key,
@@ -12,7 +16,7 @@ from urirun_flow.flow import (
     _uri_matches_template,
     _uri_segments,
 )
-from urirun_flow.flow_planner import prepare_screenshot_capture_flow
+from urirun_flow.flow_planner import heuristic_flow, make_flow, prepare_screenshot_capture_flow
 
 
 # ─── first_url ───────────────────────────────────────────────────────────────
@@ -143,6 +147,8 @@ def test_screenshot_capture_bypasses_required_verify_from_recalled_episode():
     assert verify["optional"] is True
     assert verify["payload"]["required"] is False
     assert capture["depends_on"] == ["ready"]
+    assert capture["payload"]["base64"] is True
+    assert capture["payload"]["scope"] == "browser"
 
 
 def test_injected_screenshot_capture_depends_on_step_before_required_verify():
@@ -166,6 +172,144 @@ def test_injected_screenshot_capture_depends_on_step_before_required_verify():
     assert repaired["steps"][1]["optional"] is True
     assert repaired["steps"][2]["id"] == "capture_screen"
     assert repaired["steps"][2]["depends_on"] == ["ready"]
+    assert repaired["steps"][2]["payload"] == {"scope": "browser"}
+
+
+def test_all_monitors_prompt_sets_capture_scope_all():
+    repaired = prepare_screenshot_capture_flow(
+        {"steps": []},
+        "zrob zrzut ekranu wszystkich monitorw",
+        {"kvm://host/screen/query/capture"},
+    )
+
+    capture = repaired["steps"][0]
+    assert capture["payload"] == {"scope": "all", "monitor": -1}
+
+
+def test_existing_capture_gets_all_monitor_payload_without_losing_base64():
+    flow = {"steps": [{
+        "id": "capture_screen",
+        "uri": "kvm://host/screen/query/capture",
+        "payload": {"base64": True},
+    }]}
+
+    repaired = prepare_screenshot_capture_flow(flow, "screenshot all monitors", set())
+
+    assert repaired["steps"][0]["payload"] == {"base64": True, "scope": "all", "monitor": -1}
+
+
+def test_explicit_monitor_number_is_kept_one_based():
+    repaired = prepare_screenshot_capture_flow(
+        {"steps": []},
+        "zrob zrzut ekranu monitor 2",
+        {"kvm://host/screen/query/capture"},
+    )
+
+    assert repaired["steps"][0]["payload"] == {"monitor": 2}
+
+
+def test_explicit_monitor_number_before_word_is_kept_one_based():
+    repaired = prepare_screenshot_capture_flow(
+        {"steps": []},
+        "zrob zrzut ekranu 3 monitora",
+        {"kvm://host/screen/query/capture"},
+    )
+
+    assert repaired["steps"][0]["payload"] == {"monitor": 3}
+
+
+def test_explicit_monitor_number_after_numer_is_kept_one_based():
+    repaired = prepare_screenshot_capture_flow(
+        {"steps": []},
+        "zrzut ekranu monitora numer 3",
+        {"kvm://host/screen/query/capture"},
+    )
+
+    assert repaired["steps"][0]["payload"] == {"monitor": 3}
+
+
+def test_heuristic_flow_uses_kvm_capture_for_screen_prompt_without_llm():
+    routes = [{"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True}]
+    nodes = [{"name": "host", "reachable": True}]
+
+    flow = heuristic_flow("zrob zrzut ekranu wszystkich monitorw", routes, nodes, use_llm=False)
+
+    assert [step["uri"] for step in flow["steps"]] == ["kvm://host/screen/query/capture"]
+
+
+def test_make_flow_no_llm_adds_all_monitor_payload_to_kvm_capture():
+    mesh = {
+        "nodes": [{"name": "host", "reachable": True}],
+        "routes": [{"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True}],
+    }
+
+    flow, generator = make_flow("zrob zrzut ekranu wszystkich monitorw", mesh, use_llm=False)
+
+    assert generator["provider"] == "heuristic"
+    assert flow["steps"][0]["uri"] == "kvm://host/screen/query/capture"
+    assert flow["steps"][0]["payload"] == {"scope": "all", "monitor": -1}
+
+
+def test_make_flow_llm_mode_does_not_silently_fallback_to_heuristics(monkeypatch):
+    mesh = {
+        "nodes": [{"name": "host", "reachable": True}],
+        "routes": [{"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True}],
+    }
+    monkeypatch.delenv("URIRUN_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("URIRUN_ALLOW_HEURISTIC_PLANNER_FALLBACK", raising=False)
+
+    with pytest.raises(RuntimeError, match="heuristic fallback is disabled"):
+        make_flow("zrob zrzut ekranu", mesh, use_llm=True)
+
+
+def test_thin_plan_injects_inventory_beside_drift_for_kvm_steps():
+    steps = [{"id": "cap", "uri": "kvm://host/screen/query/capture", "payload": {}}]
+
+    plan = _build_thin_plan(steps, {"steps": steps}, execute=True, memory=object(), routes=[])
+
+    assert [s["id"] for s in plan[:2]] == ["twin:drift:host", "twin:inventory:host"]
+    assert plan[1]["uri"] == "twin://host/env/query/inventory"
+
+
+def test_env_inventory_builds_monitor_domain_from_display(monkeypatch):
+    def fake_call(uri, payload, registry):
+        if uri.endswith("/display/query/info"):
+            return {
+                "width": 5888,
+                "height": 2889,
+                "monitors": [
+                    {"connector": "HDMI-1", "x": 0, "y": 1609,
+                     "logicalWidth": 2048, "logicalHeight": 1280, "primary": True},
+                    {"connector": "DP-2", "x": 2048, "y": 0,
+                     "logicalWidth": 3840, "logicalHeight": 2160},
+                ],
+            }
+        if uri.endswith("/browser/query/sessions"):
+            return {"browsers": [{"browser": "chrome", "cdp_port": 9222, "profile": "/tmp/cdp",
+                                  "running": True, "throwaway": True}]}
+        if uri.endswith("/env/query/profile"):
+            return {"platform": "linux-wayland", "wayland": True, "best": "cdp"}
+        return {}
+
+    monkeypatch.setattr("urirun_flow.flow._call_route_value", fake_call)
+
+    inv = _build_env_inventory("host", {})
+
+    assert inv["monitors"][1]["label"] == "DP-2"
+    assert inv["domains"]["env:monitors.id"][1]["value"] == 2
+    assert inv["domains"]["env:cdp_endpoints.id"][0]["value"] == "127.0.0.1:9222"
+
+
+def test_make_flow_no_llm_uses_uri_targets_when_host_is_not_in_nodes():
+    mesh = {
+        "nodes": [],
+        "routes": [{"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True}],
+    }
+
+    flow, _ = make_flow("zrob zrzut ekranu", mesh, use_llm=False)
+
+    assert [step["uri"] for step in flow["steps"]] == ["kvm://host/screen/query/capture"]
 
 
 def test_screenshot_repair_keeps_required_verify_that_guards_later_command():
@@ -197,3 +341,20 @@ def test_screenshot_repair_keeps_required_verify_that_guards_later_command():
     assert "optional" not in repaired["steps"][1]
     assert repaired["steps"][1]["payload"]["required"] is True
     assert repaired["steps"][3]["depends_on"] == ["click"]
+    assert repaired["steps"][3]["payload"]["scope"] == "browser"
+
+
+def test_desktop_screenshot_without_cdp_keeps_os_capture_scope():
+    flow = {
+        "steps": [
+            {
+                "id": "capture_screen",
+                "uri": "kvm://host/screen/query/capture",
+                "payload": {},
+                "depends_on": [],
+            },
+        ]
+    }
+    repaired = prepare_screenshot_capture_flow(flow, "zrob zrzut ekranu pulpitu", set())
+
+    assert "scope" not in repaired["steps"][0]["payload"]
