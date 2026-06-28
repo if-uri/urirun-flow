@@ -175,6 +175,41 @@ def test_normalize_binds_window_list_monitor_into_capture():
     assert "monitor" not in capture["payload"]
 
 
+def test_normalize_strips_conflicting_scope_all_when_llm_set_monitor_from():
+    """Regression: the LLM set monitor_from itself BUT also left scope:all (its own
+    WINDOW-MONITOR RULE violation). The old normalizer bailed when monitor_from was already
+    present, so scope:all survived and the connector captured every monitor instead of the
+    app's one. The conflict must be stripped so the resolved monitor wins."""
+    allowed = {"kvm://host/window/query/list", "kvm://host/screen/query/capture"}
+    routes = [
+        {"uri": "kvm://host/window/query/list",
+         "inputSchema": {"type": "object", "properties": {"app": {"type": "string"}},
+                         "additionalProperties": False}},
+        {"uri": "kvm://host/screen/query/capture",
+         "inputSchema": {"type": "object",
+                         "properties": {"monitor": {"type": "integer"}, "scope": {"type": "string"}},
+                         "additionalProperties": False}},
+    ]
+    flow = {
+        "task": {"id": "shot"},
+        "steps": [
+            {"id": "list_chrome_windows", "uri": "kvm://host/window/query/list",
+             "payload": {"app": "chrome"}, "depends_on": []},
+            {"id": "capture_chrome_monitor", "uri": "kvm://host/screen/query/capture",
+             "payload": {"monitor": -1, "scope": "all",
+                         "monitor_from": "list_chrome_windows.result.value.selected.monitor"},
+             "depends_on": ["list_chrome_windows"]},
+        ],
+    }
+
+    capture = normalize_flow(flow, allowed, routes=routes)["steps"][1]
+
+    assert "scope" not in capture["payload"]          # the conflicting scope:all is gone
+    assert "monitor" not in capture["payload"]        # the placeholder monitor:-1 is gone
+    assert capture["payload"]["monitor_from"] == "list_chrome_windows.result.value.selected.monitor"
+    assert capture["depends_on"] == ["list_chrome_windows"]
+
+
 def test_normalize_rejects_unknown_result_reference_against_strict_schema():
     allowed = {"kvm://host/screen/query/capture"}
     routes = [{
@@ -198,6 +233,47 @@ def test_normalize_rejects_unknown_result_reference_against_strict_schema():
             allowed,
             routes=routes,
         )
+
+
+def test_normalize_strips_angle_brackets_from_result_reference_step_id():
+    allowed = {
+        "kvm://host/window/query/list",
+        "kvm://host/screen/query/capture",
+    }
+    routes = [
+        {
+            "uri": "kvm://host/window/query/list",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": True},
+        },
+        {
+            "uri": "kvm://host/screen/query/capture",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"monitor": {"type": "integer"}},
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+    normalized = normalize_flow(
+        {
+            "steps": [
+                {"id": "list_windows", "uri": "kvm://host/window/query/list", "payload": {}},
+                {
+                    "id": "capture",
+                    "uri": "kvm://host/screen/query/capture",
+                    "payload": {"monitor_from": "<list_windows>.result.value.selected.monitor"},
+                    "depends_on": ["list_windows"],
+                },
+            ],
+        },
+        allowed,
+        routes=routes,
+    )
+
+    assert normalized["steps"][1]["payload"]["monitor_from"] == (
+        "list_windows.result.value.selected.monitor"
+    )
 
 
 # ─── screenshot capture repair ──────────────────────────────────────────────

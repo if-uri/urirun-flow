@@ -504,6 +504,13 @@ def _capture_needs_window_monitor(payload: dict) -> bool:
     return scope in {"", "all", "all-monitors", "desktop"} or payload.get("monitor") in (None, "", 0, -1)
 
 
+def _capture_scope_conflicts_with_ref(payload: dict) -> bool:
+    """True when the LLM set ``monitor_from`` but also left an all-monitors ``scope`` that the
+    contract's skipWhen would let override the resolved single monitor."""
+    return bool(payload.get("monitor_from")) and str(
+        payload.get("scope") or "").strip().lower() in {"all", "all-monitors", "desktop"}
+
+
 def _bind_window_monitor_capture(steps: list[dict]) -> list[dict]:
     """Bind window-list results into later screen capture monitor payloads.
 
@@ -522,11 +529,15 @@ def _bind_window_monitor_capture(steps: list[dict]) -> list[dict]:
             continue
         if uri.endswith(_SCREEN_CAPTURE_SUFFIX) and latest_window_step is not None:
             payload = dict(step.get("payload") or {})
-            if _capture_needs_window_monitor(payload):
+            needs = _capture_needs_window_monitor(payload)
+            # The LLM may set monitor_from itself but ALSO leave scope:all — its own WINDOW-MONITOR
+            # RULE violation that would override the resolved monitor and grab every monitor.
+            if needs or _capture_scope_conflicts_with_ref(payload):
                 payload.pop("scope", None)
                 if not _positive_int(payload.get("monitor")):
                     payload.pop("monitor", None)
-                payload["monitor_from"] = f"{latest_window_step['id']}.result.value.selected.monitor"
+                if needs:
+                    payload["monitor_from"] = f"{latest_window_step['id']}.result.value.selected.monitor"
                 deps = list(step.get("depends_on") or [])
                 if latest_window_step["id"] not in deps:
                     deps.append(latest_window_step["id"])
@@ -926,6 +937,36 @@ def _rewrite_cdp_profile_for_auth(steps: list[dict]) -> list[dict]:
     return out
 
 
+def _normalize_result_reference_payloads(steps: list[dict]) -> list[dict]:
+    """Canonicalize flow result references after step ids are canonical.
+
+    LLMs sometimes copy placeholder notation into the DSL, e.g.
+    ``<step_1>.result.value.id``. ``*_from`` values are not connector payload
+    fields; they are flow references, so normalize only that syntax surface.
+    """
+    ids = {str(step.get("id") or "") for step in steps}
+    literal_from_keys = {"copy_from"}
+    out: list[dict] = []
+    for step in steps:
+        payload = step.get("payload")
+        if not isinstance(payload, dict):
+            out.append(step)
+            continue
+        changed = False
+        new_payload: dict = {}
+        for key, value in payload.items():
+            if key.endswith("_from") and key not in literal_from_keys and isinstance(value, str):
+                head, sep, tail = value.strip().partition(".")
+                clean_head = head.strip().strip("<>").strip()
+                if clean_head in ids and clean_head != head:
+                    new_payload[key] = f"{clean_head}{sep}{tail.rstrip('>')}"
+                    changed = True
+                    continue
+            new_payload[key] = value
+        out.append({**step, "payload": new_payload} if changed else step)
+    return out
+
+
 def normalize_flow(flow: dict, allowed_uris: set[str], routes: list[dict] | None = None,
                    infeasible_constraints: list[dict] | None = None) -> dict:
     task = flow.get("task") if isinstance(flow.get("task"), dict) else {}
@@ -939,6 +980,7 @@ def normalize_flow(flow: dict, allowed_uris: set[str], routes: list[dict] | None
     steps = _strip_focus_from_cdp_flows(steps)
     steps = _rewrite_cdp_profile_for_auth(steps)
     steps = _inject_cdp_ready_probes(steps, allowed_uris, used, routes=routes)
+    steps = _normalize_result_reference_payloads(steps)
     steps = _bind_window_monitor_capture(steps)
     return {"task": _normalize_flow_task(task), "steps": steps}
 
@@ -1042,7 +1084,7 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
                 "GATE VERIFY: when a verify step checks for login/presence of a UI element that is REQUIRED for the next action (e.g. 'Zacznij publikację' before clicking Publish), add {\"required\": true} to the verify payload — this fails the flow early when not logged in, instead of continuing into failing click steps. "
                 "LOGIN PROFILE: when the task requires being logged in to a service (LinkedIn, Google, GitHub…), set {\"copy_from\": \"~/.config/google-chrome\"} (the user-data-dir ROOT, not the Default subdir) in the cdp/session/command/ensure payload — this CLONES the saved session cookies into a dedicated CDP profile so Chrome opens already logged in WITHOUT fighting the live profile's lock. Do NOT set user_data_dir to the live profile (it launches over the SingletonLock and copies no cookies → login wall); never use an empty or temp profile for tasks that require authentication. "
                 "SCREENSHOT RULE: when the request contains 'screenshot', 'zrzut ekranu', 'capture', 'snap' or similar, the LAST step MUST be screen/query/capture — ALWAYS, regardless of login state, page content, or what verify found. Never substitute a log note for a screenshot step. "
-                "WINDOW-MONITOR RULE: when the request asks for the monitor/screen that contains a named app/window/browser, first use window/query/list with the app or title field grounded from the request, then make screen/query/capture depend on that step and set monitor_from to '<window_step_id>.result.value.selected.monitor'. Do not use scope:'all' for a single-monitor request tied to an app/window. "
+                "WINDOW-MONITOR RULE: when the request asks for the monitor/screen that contains a named app/window/browser, first use window/query/list with the app or title field grounded from the request, then make screen/query/capture depend on that step and set monitor_from to the real prior step id plus '.result.value.selected.monitor', for example 'list_chrome_windows.result.value.selected.monitor'. Do not use scope:'all' for a single-monitor request tied to an app/window. "
                 # Concrete-state grounding: when an 'environments' field is present it is the LIVE
                 # capability profile + foreground surface of each node — GROUND your steps on it:
                 "honour each node's 'bestSurface' and ALL items in its 'guidance' list (they are "

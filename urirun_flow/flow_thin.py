@@ -26,7 +26,15 @@ def _dig_path(data: Any, dotted: str) -> Any:
     cur = data
     for part in dotted.split("."):
         if isinstance(cur, dict):
-            cur = cur[part]
+            if part in cur:
+                cur = cur[part]
+            elif part == "value":
+                # Some dispatch paths return connector payloads as result.value,
+                # others return the connector payload directly under result.
+                # Treat the envelope's value segment as optional for chaining.
+                cur = cur
+            else:
+                raise KeyError(part)
         elif isinstance(cur, (list, tuple)):
             cur = cur[int(part)]
         else:
