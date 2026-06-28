@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 # Meta-package: ships NO import package of its own (the bundled `urirun` owns `urirun_flow`,
 # which holds both the typed-flow DSL and the flow engine), so installing this alongside
 # `urirun` cannot shadow the bundle copy. The `urirun-flow` console script comes from `urirun`.
-dependencies = ["urirun>=0.4.186"]
+dependencies = ["urirun>=0.4.190"]
 
 [tool.setuptools]
 packages = []                # meta-package — no import package shipped

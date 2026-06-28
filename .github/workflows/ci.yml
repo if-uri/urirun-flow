@@ -1,0 +1,25 @@
+name: ci
+
+# Import-smoke for this meta-package: it ships NO source (packages = []). Its ONLY
+# promise is that `pip install urirun-flow` makes `import urirun_flow` resolve via the
+# `urirun` dependency. Verify that on every push/PR so a namespace rename or a dropped
+# package in `urirun` can't silently break this wrapper (release.yml only publishes).
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  import-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install this meta-package (pulls urirun) and verify the namespace resolves
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+          python -c "import urirun_flow; print('urirun_flow import OK')"
