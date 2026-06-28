@@ -2,6 +2,12 @@
 
 All notable changes to **urirun-flow** ([Keep a Changelog](https://keepachangelog.com), [SemVer](https://semver.org)).
 
+## [0.2.1]
+
+### Changed
+- `urirun-flow` is now the real-source owner of the `urirun_flow` import package and
+  the `urirun-flow` console script, instead of a meta-package depending on `urirun`.
+
 ## [0.1.0]
 
 ### Added

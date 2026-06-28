@@ -48,7 +48,12 @@ real step, and the graph is acyclic. `kind` (`query`/`command`) is derived from 
 urirun-flow to-yaml web_recon:flow      # import a Python flow object → YAML
 urirun-flow validate flow.yaml          # DAG / deps / URIs
 urirun-flow from-yaml flow.yaml         # parse + re-emit (normalize / round-trip)
+urirun-flow run flow.yaml --execute     # execute through urirun when the runtime is installed
 ```
+
+The `urirun_flow` import package is owned by this distribution. Typed authoring
+and YAML validation need only `urirun-flow`; execution needs the `urirun` runtime
+installed as well.
 
 ## Proposal: typed flows in any language
 
