@@ -307,3 +307,22 @@ def resolve_flow_env_enums(
     )
     result = resolve_env_enums(flow, routes, resolved_inventories or {}, memory=memory, prompt=prompt)
     return {**result, "inventories": resolved_inventories or {}}
+
+
+def resolve_flow_env_enums_with_registry(
+    flow: dict,
+    routes: list[dict],
+    registry: dict,
+    *,
+    memory: Any = None,
+    prompt: str = "",
+) -> dict:
+    """Like resolve_flow_env_enums but builds inventory from a registry dict."""
+    from urirun_flow.flow import _build_env_inventory  # noqa: PLC0415
+    return resolve_flow_env_enums(
+        flow,
+        routes,
+        memory=memory,
+        prompt=prompt,
+        inventory_builder=lambda node: _build_env_inventory(node, registry),
+    )
