@@ -48,6 +48,12 @@ def append_if_available(steps: list[dict], route_uris: set[str], uri: str, paylo
     return step_id
 
 
+def _time_query_uri_for_target(route_uris: set[str], target: str) -> str | None:
+    """Return the typed time query route for a target when the action space offers it."""
+    uri = f"time://{target}/clock/query/now"
+    return uri if uri in route_uris else None
+
+
 # ── Intent classification constants and helpers ───────────────────────────────
 
 _DEFAULT_LOG_LIMIT = 20
@@ -234,8 +240,12 @@ def _append_target_steps(steps: list[dict], route_uris: set, target: str, intent
             previous = ensure_health(previous)
             previous = append_if_available(steps, route_uris, f"shell://{target}/command/which", {"binary": binary}, previous)
     if intents["date"]:
-        previous = ensure_health(previous)
-        previous = append_if_available(steps, route_uris, f"shell://{target}/command/date", {}, previous)
+        time_uri = _time_query_uri_for_target(route_uris, target)
+        if time_uri:
+            previous = append_if_available(steps, route_uris, time_uri, {}, previous)
+        else:
+            previous = ensure_health(previous)
+            previous = append_if_available(steps, route_uris, f"shell://{target}/command/date", {}, previous)
     if intents["uname"]:
         previous = ensure_health(previous)
         previous = append_if_available(steps, route_uris, f"shell://{target}/command/uname", {}, previous)

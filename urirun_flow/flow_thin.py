@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from urirun_flow.envelope import result_data
-from urirun_connector_router.routing import route_target
+from urirun_connector_router.routing import effect_of, route_target
 
 
 # ─── Shared step utilities ────────────────────────────────────────────────────
@@ -319,7 +319,7 @@ def _thin_step_entry(sid: str, uri: str, r: dict) -> dict:
     if inv_uri:
         entry["reversible"] = True
         entry["inverse"] = {"uri": inv_uri, "args": (inv or {}).get("args") or {}}
-    elif "/query/" in (uri or ""):
+    elif effect_of(uri) == "query":
         # Read-only step: no state change, trivially reversible, no explicit inverse needed.
         entry["reversible"] = True
     else:

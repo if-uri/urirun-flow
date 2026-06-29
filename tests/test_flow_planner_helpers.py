@@ -531,6 +531,40 @@ def test_make_flow_no_llm_adds_all_monitor_payload_to_kvm_capture():
     assert flow["steps"][0]["payload"] == {"scope": "all", "monitor": -1}
 
 
+def test_date_prompt_prefers_typed_time_query_over_shell_command():
+    routes = [
+        {"uri": "env://host/runtime/query/health", "node": "host", "safe": True},
+        {"uri": "time://host/clock/query/now", "node": "host", "safe": True},
+        {"uri": "shell://host/command/date", "node": "host", "safe": True},
+    ]
+    nodes = [{"name": "host", "reachable": True}]
+
+    flow = heuristic_flow("jaka jest data?", routes, nodes, selected_nodes=["host"], use_llm=False)
+
+    assert [step["uri"] for step in flow["steps"]] == ["time://host/clock/query/now"]
+
+
+def test_date_prompt_keeps_shell_fallback_when_time_query_route_is_absent():
+    routes = [
+        {"uri": "env://lenovo/runtime/query/health", "node": "lenovo", "safe": True},
+        {"uri": "shell://lenovo/command/date", "node": "lenovo", "safe": True},
+    ]
+    nodes = [{"name": "lenovo", "reachable": True}]
+
+    flow = heuristic_flow(
+        "jaka jest data na lenovo laptop",
+        routes,
+        nodes,
+        selected_nodes=["lenovo"],
+        use_llm=False,
+    )
+
+    assert [step["uri"] for step in flow["steps"]] == [
+        "env://lenovo/runtime/query/health",
+        "shell://lenovo/command/date",
+    ]
+
+
 def test_make_flow_llm_outage_degrades_to_heuristic_by_default(monkeypatch):
     # Inverted planner policy: the LLM leads, but a planner outage (here: no model configured)
     # DEGRADES to the deterministic heuristic by default — the operator gets a result, not a wall.

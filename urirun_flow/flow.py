@@ -62,6 +62,7 @@ from urirun_flow.recovery import (
 from urirun_connector_router.routing import (
     accept_plan as accept_routing_plan,
     diagnose_plan as diagnose_routing_plan,
+    effect_of,
     execution_layers as routing_execution_layers,
     registry_from_routes,
     route_target,
@@ -189,8 +190,8 @@ def _flow_timeline_entry(step: dict, env: dict, routes: list[dict], *, attempt: 
         error = exception_error(Exception("unknown URI error"), uri=uri) if not raw else normalize_error(raw, uri=uri)
         entry["error"] = error
         entry["recovery"] = recovery_plan(error, step=step, routes=routes, environment=environment)
-    # Read-only steps (/query/) are trivially reversible; command steps without an explicit inverse are not.
-    entry["reversible"] = "/query/" in uri
+    # Read-only steps are trivially reversible; command steps without an explicit inverse are not.
+    entry["reversible"] = effect_of(uri) == "query"
     return entry
 
 
@@ -853,11 +854,16 @@ def _apply_routing_targets(result: dict, report: dict) -> None:
         for step in (report.get("steps") or [])
         if step.get("runsOn")
     }
+    effects = {
+        str(step.get("uri") or ""): step.get("effect")
+        for step in (report.get("steps") or [])
+        if step.get("effect")
+    }
     for uri, target in (report.get("runsOnByStep") or {}).items():
         if target:
             runs_on[str(uri)] = target
     if not runs_on:
-        return
+        runs_on = {}
     for entry in result.get("timeline") or []:
         uri = str(entry.get("uri") or "")
         if uri in runs_on:
@@ -866,6 +872,8 @@ def _apply_routing_targets(result: dict, report: dict) -> None:
             step_result = (result.get("results") or {}).get(sid)
             if isinstance(step_result, dict):
                 step_result["target"] = runs_on[uri]
+        if effects.get(uri) == "query":
+            entry["reversible"] = True
 
 
 def execute_flow(flow: dict, mesh: dict, registry: dict, execute: bool, *, recover: bool = True,
