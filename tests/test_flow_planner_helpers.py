@@ -22,6 +22,7 @@ from urirun_flow.flow_planner import (
     heuristic_flow,
     make_flow,
     normalize_flow,
+    normalize_flow_or_explain,
     prepare_screenshot_capture_flow,
 )
 
@@ -250,6 +251,37 @@ def test_safe_planner_error_redacts_urls_and_key_fragments():
     assert "https://" not in msg
     assert "secret123" not in msg
     assert "Insufficient credits" in msg
+
+
+def test_empty_flow_with_llm_quota_reason_does_not_suggest_node_url():
+    routes = [{"uri": "adb://host/input/command/key", "node": "host", "safe": True}]
+    reason = 'litellm.APIError: OpenrouterException - {"error":{"message":"Key limit exceeded","code":403}}'
+
+    with pytest.raises(ValueError) as err:
+        normalize_flow_or_explain(
+            {"steps": []},
+            {"adb://host/input/command/key"},
+            routes=routes,
+            selected_nodes=["host"],
+            planner_reason=reason,
+        )
+
+    msg = str(err.value)
+    assert "LLM planner/provider failed" in msg
+    assert "--node-url" not in msg
+
+
+def test_empty_flow_without_routes_keeps_node_url_hint():
+    with pytest.raises(ValueError) as err:
+        normalize_flow_or_explain(
+            {"steps": []},
+            set(),
+            routes=[],
+            selected_nodes=["laptop"],
+            planner_reason="LLM disabled",
+        )
+
+    assert "--node-url" in str(err.value)
 
 
 def test_normalize_rejects_unknown_result_reference_against_strict_schema():

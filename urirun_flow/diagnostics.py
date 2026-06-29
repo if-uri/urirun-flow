@@ -231,6 +231,27 @@ PLAYBOOK: list[_Rule] = [
         confidence=0.75,
     ),
     _Rule(
+        "llm-provider-quota",
+        [r"openrouter.*(key limit exceeded|insufficient credit|quota|rate limit)",
+         r"(key limit exceeded|insufficient credit|quota exceeded|rate limit).*openrouter",
+         r"litellm.*(insufficient credit|quota|rate limit|key limit)",
+         r"(resource exhausted|too many requests).*llm",
+         r"planner reason:.*(key limit exceeded|insufficient credit|quota|rate limit)"],
+        "The LLM provider rejected the planning request because the model/API key is out of quota, "
+        "rate-limited, or otherwise exhausted. This is a planner/provider condition, not a node URL "
+        "or connector-routing failure.",
+        lambda t: [
+            {"id": "switch-llm-model-or-key", "kind": "auth", "automatic": False,
+             "label": "Switch to a model/key with quota (URIRUN_LLM_MODEL/LLM_MODEL and provider API key)."},
+            {"id": "retry-no-llm", "kind": "retry", "automatic": False,
+             "label": "Retry with noLlm=true when the deterministic planner can cover this intent."},
+            {"id": "use-retrieved-known-good", "kind": "planner", "automatic": False,
+             "label": "If a verified known-good episode exists for this intent/environment, recall it and revalidate."},
+        ],
+        categories={"INVALID_ARGUMENT", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION"},
+        confidence=0.95,
+    ),
+    _Rule(
         "auth-required",
         [r"api key (not set|missing|required)", r"secret(?: not)? (found|resolved|set)",
          r"secretref.*(not found|missing|unresolvable)",

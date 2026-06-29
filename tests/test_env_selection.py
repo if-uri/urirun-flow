@@ -139,3 +139,64 @@ def test_recalled_concrete_valid_env_enum_can_shortcut():
     )
 
     assert res["required"] is False
+
+
+def test_one_env_enum_resolver_handles_multiple_device_domains():
+    class Memory:
+        def recall_preference(self, node, name, fingerprint):
+            assert (node, fingerprint) == ("host", "env-interop")
+            if name == "audio.default":
+                return {"value": "usb"}
+            return None
+
+    routes = [
+        {"uri": "kvm://host/camera/query/snap",
+         "meta": {"contract": {"domains": {"camera": {
+             "type": "enum", "domain": "env:cameras.id", "preference": "camera.default"}}}}},
+        {"uri": "audio://host/sink/command/route",
+         "meta": {"contract": {"domains": {"sink": {
+             "type": "enum", "domain": "env:audio_sinks.id", "preference": "audio.default"}}}}},
+        *ROUTES,
+    ]
+    inventories = {"host": {"node": "host", "fingerprint": "env-interop", "domains": {
+        "env:cameras.id": [{"value": 0}],
+        "env:audio_sinks.id": [{"value": "hdmi"}, {"value": "usb"}],
+        "env:monitors.id": [{"value": 1}, {"value": 2}, {"value": 3}],
+    }}}
+
+    camera = resolve_env_enums(
+        {"steps": [{"id": "camera", "uri": "kvm://host/camera/query/snap", "payload": {}}]},
+        routes, inventories, memory=Memory())
+    audio = resolve_env_enums(
+        {"steps": [{"id": "sink", "uri": "audio://host/sink/command/route", "payload": {}}]},
+        routes, inventories, memory=Memory())
+    monitor = resolve_env_enums(_flow(), routes, inventories, memory=Memory())
+
+    assert camera["ok"] is True
+    assert camera["flow"]["steps"][0]["payload"]["camera"] == 0
+    assert camera["decisions"][0]["source"] == "single"
+    assert audio["ok"] is True
+    assert audio["flow"]["steps"][0]["payload"]["sink"] == "usb"
+    assert audio["decisions"][0]["source"] == "remembered"
+    assert monitor["kind"] == "needs-selection"
+    assert monitor["needsSelection"]["parameter"] == "monitor"
+
+
+def test_new_env_enum_device_needs_declaration_not_resolver_code():
+    before = resolve_env_enums.__code__.co_code
+    route = {"uri": "print://host/doc/command/print",
+             "meta": {"contract": {"domains": {"printer": {
+                 "type": "enum", "domain": "env:printers.id"}}}}}
+    inventory = {"host": {"node": "host", "fingerprint": "env-printers", "domains": {
+        "env:printers.id": [{"value": "hp"}, {"value": "epson"}],
+    }}}
+
+    res = resolve_env_enums(
+        {"steps": [{"id": "print", "uri": "print://host/doc/command/print", "payload": {}}]},
+        [route],
+        inventory,
+    )
+
+    assert res["kind"] == "needs-selection"
+    assert [opt["value"] for opt in res["needsSelection"]["options"]] == ["hp", "epson"]
+    assert resolve_env_enums.__code__.co_code == before

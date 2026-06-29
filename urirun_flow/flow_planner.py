@@ -1364,13 +1364,33 @@ def normalize_flow_or_explain(
             "routeSample": sample,
         }
         reason = f"; planner reason: {planner_reason}" if planner_reason else ""
+        hint = _empty_flow_hint(len(allowed_uris), planner_reason)
         raise ValueError(
             "NL flow generated no URI steps. "
             f"Discovered {detail['safeRoutes']} safe route(s) on node(s) {nodes or '[]'}"
             f"{'; selected ' + repr(selected_nodes) if selected_nodes else ''}. "
-            "Check the mesh config or pass --node-url [NAME=]URL. "
+            f"{hint} "
             f"Sample routes: {sample}{reason}"
         ) from exc
+
+
+def _empty_flow_hint(safe_route_count: int, planner_reason: str = "") -> str:
+    reason = str(planner_reason or "").casefold()
+    llm_outage = any(signal in reason for signal in (
+        "litellm",
+        "openrouter",
+        "key limit exceeded",
+        "insufficient credit",
+        "quota",
+        "rate limit",
+        "llm planner",
+    ))
+    if safe_route_count and llm_outage:
+        return (
+            "LLM planner/provider failed and the deterministic fallback produced no steps; "
+            "check LLM model/key/quota, retry with noLlm=true when covered, or use a verified known-good episode."
+        )
+    return "Check the mesh config or pass --node-url [NAME=]URL."
 
 
 # ── LLM flow generation ───────────────────────────────────────────────────────
