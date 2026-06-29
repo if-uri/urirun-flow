@@ -387,14 +387,30 @@ def heuristic_flow(prompt: str, routes: list[dict], nodes: list[dict], selected_
 
 def json_from_text(text: str) -> dict:
     stripped = text.strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.S)
-    if fenced:
-        stripped = fenced.group(1)
-    elif not stripped.startswith("{"):
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start >= 0 and end > start:
-            stripped = stripped[start : end + 1]
+    decoder = json.JSONDecoder()
+
+    def _candidates(raw: str) -> list[dict]:
+        found: list[dict] = []
+        for idx, ch in enumerate(raw):
+            if ch != "{":
+                continue
+            try:
+                parsed, _end = decoder.raw_decode(raw[idx:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                found.append(parsed)
+        return found
+
+    blocks = [m.group(1) for m in re.finditer(r"```(?:json)?\s*(.*?)\s*```", stripped, re.S)]
+    candidates: list[dict] = []
+    for block in blocks or [stripped]:
+        candidates.extend(_candidates(block))
+    if candidates:
+        for candidate in candidates:
+            if isinstance(candidate.get("task"), dict) and isinstance(candidate.get("steps"), list):
+                return candidate
+        return candidates[0]
     return json.loads(stripped)
 
 

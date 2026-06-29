@@ -128,6 +128,17 @@ def test_json_from_text_embedded():
     assert json_from_text(text)["ok"] is True
 
 
+def test_json_from_text_ignores_extra_json_after_flow():
+    text = (
+        '{"task":{"id":"shot"},"steps":[{"id":"capture","uri":"kvm://host/screen/query/capture"}]}\n'
+        '{"notes":"model appended a second object"}'
+    )
+    result = json_from_text(text)
+
+    assert result["task"]["id"] == "shot"
+    assert result["steps"][0]["id"] == "capture"
+
+
 def test_normalize_binds_window_list_monitor_into_capture():
     allowed = {
         "kvm://host/window/query/list",
