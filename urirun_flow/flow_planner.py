@@ -314,6 +314,21 @@ def _window_anchor_from_environment(prompt: str, environments: list[dict] | None
     return {"payload": best[2]} if best else None
 
 
+def _prompt_needs_window_inventory(prompt: str) -> bool:
+    """True when planner context should include live windows, not only monitor inventory.
+
+    This is a prefetch decision, not a route plan: the actual selected app/window still comes from
+    live `window/query/list` data via `_window_anchor_from_environment`.
+    """
+    low = nl_key(prompt)
+    if not _flow_intents_lexical(prompt).get("screen"):
+        return False
+    return bool(
+        re.search(r"\b(na\s+kt[oó]r\w+|gdzie|where|which|contains?|zawiera|jest)\b", low)
+        or re.search(r"\b(okn\w+|window|app|aplikac\w+|browser|przegl\w+)\b", low)
+    )
+
+
 def heuristic_flow(prompt: str, routes: list[dict], nodes: list[dict], selected_nodes: list[str] | None = None,
                    *, use_llm: bool = True, environments: list[dict] | None = None) -> dict:
     selected = target_nodes(prompt, nodes, selected_nodes)
@@ -1734,7 +1749,7 @@ def _fetch_surface(step: dict, registry: dict) -> dict | None:
 # ── Planner environment fetching ──────────────────────────────────────────────
 
 def fetch_planner_environments(node_names: list[str], registry: dict, mesh: dict | None = None,
-                               *, memory: "TwinMemory | None" = None) -> list[dict]:
+                               *, memory: "TwinMemory | None" = None, prompt: str = "") -> list[dict]:
     """Best-effort live capability profile + foreground surface per node, formatted as
     planner_context facts+guidance — so the planner GROUNDS on reality (surface, language,
     known-good, drift) instead of guessing. Sets the serviceMap from ``mesh`` so the kvm queries
@@ -1750,7 +1765,12 @@ def fetch_planner_environments(node_names: list[str], registry: dict, mesh: dict
             twin_profile = _twin_host_query(name, registry, "environment/query/profile")
             if _is_twin_environment_profile(twin_profile):
                 twin_inventory = _twin_host_query(name, registry, "environment/query/inventory")
-                out.append(_planner_context_from_twin(name, twin_profile, twin_inventory, memory=memory))
+                ctx = _planner_context_from_twin(name, twin_profile, twin_inventory, memory=memory)
+                if _prompt_needs_window_inventory(prompt):
+                    win = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "window/query/list", "windows")
+                    if isinstance(win, dict):
+                        ctx["windows"] = [w for w in (win.get("windows") or []) if isinstance(w, dict)]
+                out.append(ctx)
                 continue
             prof = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "env/query/profile", "controlStrategies")
             if not prof:

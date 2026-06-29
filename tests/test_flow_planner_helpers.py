@@ -690,6 +690,39 @@ def test_fetch_planner_environments_prefers_twin_profile_inventory(monkeypatch):
     assert not any(uri.startswith("kvm://") for _, uri, _ in calls)
 
 
+def test_fetch_planner_environments_adds_windows_for_window_anchor_prompt(monkeypatch):
+    calls = []
+
+    def fake_local(uri, payload=None):
+        calls.append(("local", uri, dict(payload or {})))
+        if uri == "twin://host/environment/query/profile":
+            return {"ok": True, "result": {"value": {
+                "ok": True,
+                "node": "host",
+                "profile": {"controlStrategies": {"atspi": True}, "best": "atspi"},
+            }}}
+        if uri == "twin://host/environment/query/inventory":
+            return {"ok": True, "result": {"value": {"ok": True, "node": "host", "monitors": []}}}
+        if uri == "kvm://host/window/query/list":
+            return {"ok": True, "result": {"value": {
+                "ok": True,
+                "windows": [{"app": "Google Chrome", "title": "Chrome", "monitor": 2}],
+            }}}
+        return None
+
+    monkeypatch.setattr(planner, "_local_inprocess_query", fake_local)
+
+    envs = planner.fetch_planner_environments(
+        ["host"],
+        registry={},
+        mesh={"serviceMap": {}},
+        prompt="zrób zrzut ekranu monitora, na którym jest Chrome",
+    )
+
+    assert envs[0]["windows"] == [{"app": "Google Chrome", "title": "Chrome", "monitor": 2}]
+    assert any(uri == "kvm://host/window/query/list" for _, uri, _ in calls)
+
+
 def test_env_inventory_builds_monitor_domain_from_display(monkeypatch):
     def fake_call(uri, payload, registry):
         if uri.endswith("/display/query/info"):
