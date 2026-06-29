@@ -71,12 +71,20 @@ def requested_folder_path(lowered: str) -> str:
     return "."
 
 
-def _flow_intents_llm(prompt: str) -> dict[str, bool] | None:
+def _configured_llm_model(override: str | None = None) -> str | None:
+    for value in (override, os.getenv("URIRUN_LLM_MODEL"), os.getenv("LLM_MODEL")):
+        model = str(value or "").strip()
+        if model:
+            return model
+    return None
+
+
+def _flow_intents_llm(prompt: str, llm_model: str | None = None) -> dict[str, bool] | None:
     """Ask the LLM to classify the prompt into the known intent set.
 
     Returns a complete {intent: bool} dict on success, None when LLM is not
     configured or the call fails — callers fall back to the default intent."""
-    model = os.getenv("URIRUN_LLM_MODEL") or os.getenv("LLM_MODEL")
+    model = _configured_llm_model(llm_model)
     if not model:
         return None
     try:
@@ -118,7 +126,10 @@ def _flow_intents_lexical(prompt: str) -> dict[str, bool]:
     intents["uname"] = has(r"\buname\b", r"\bsystem info\b", r"\bkernel\b", r"\bos\b")
     intents["files"] = has(r"\bfiles?\b", r"\bfolder\b", r"\bdirectory\b", r"\bdownloads?\b", r"\bpliki\b", r"\bpobrane\b")
     intents["invoices"] = has(r"\binvoices?\b", r"\bfaktur", r"\brachun")
-    intents["screen"] = has(r"\bscreenshot\b", r"\bcapture\b", r"\bscreen\b", r"\bzrzut\b", r"\bekran")
+    intents["screen"] = has(
+        r"\bscreenshot\b", r"\bcapture\b", r"\bscreen\b", r"\bmonitor(?:a|ze|ow|y)?\b",
+        r"\bzrzut\w*\b", r"\bekran\w*\b", r"\bscreen\w*\b", r"\bprzechwyc\w*\b",
+    )
     return intents
 
 
@@ -146,7 +157,8 @@ def _flow_intents(prompt: str, *, use_llm: bool = True) -> dict[str, bool]:
 
 # ── Heuristic flow building ───────────────────────────────────────────────────
 
-def _append_target_steps(steps: list[dict], route_uris: set, target: str, intents: dict[str, bool], url: str, previous):
+def _append_target_steps(steps: list[dict], route_uris: set, target: str, intents: dict[str, bool],
+                         url: str, previous, *, prompt: str = "", window_anchor: dict | None = None):
     """Append the available steps for one target node, returning the new previous-step id."""
     health_added = False
 
@@ -178,7 +190,21 @@ def _append_target_steps(steps: list[dict], route_uris: set, target: str, intent
         )
     if intents["screen"]:
         previous = ensure_health(previous)
-        previous = append_if_available(steps, route_uris, f"kvm://{target}/screen/query/capture", {}, previous)
+        capture_payload = _screenshot_capture_payload(prompt)
+        window_uri = f"kvm://{target}/window/query/list"
+        capture_uri = f"kvm://{target}/screen/query/capture"
+        if window_anchor and window_uri in route_uris and capture_uri in route_uris:
+            window_payload = dict(window_anchor.get("payload") or {})
+            window_step = append_if_available(steps, route_uris, window_uri, window_payload, previous)
+            if window_step:
+                payload = {**capture_payload, "monitor_from": f"{window_step}.result.value.selected.monitor"}
+                payload.pop("monitor", None)
+                payload.pop("scope", None)
+                previous = append_if_available(steps, route_uris, capture_uri, payload, window_step)
+            else:
+                previous = append_if_available(steps, route_uris, capture_uri, capture_payload, previous)
+        else:
+            previous = append_if_available(steps, route_uris, capture_uri, capture_payload, previous)
         previous = append_if_available(steps, route_uris, f"screen://{target}/portal/query/capture", {}, previous)
         previous = append_if_available(
             steps,
@@ -219,7 +245,67 @@ def _append_target_steps(steps: list[dict], route_uris: set, target: str, intent
     return previous
 
 
-def heuristic_flow(prompt: str, routes: list[dict], nodes: list[dict], selected_nodes: list[str] | None = None, *, use_llm: bool = True) -> dict:
+_WINDOW_ANCHOR_STOPWORDS = {
+    "the", "and", "for", "with", "where", "showing", "open", "opened",
+    "main", "stage", "desktop", "icons", "frame", "window",
+}
+
+
+def _text_tokens(text: object) -> set[str]:
+    return {
+        tok for tok in re.findall(r"[a-z0-9]{3,}", nl_key(str(text or "")))
+        if tok not in _WINDOW_ANCHOR_STOPWORDS
+    }
+
+
+def _environment_windows(env: dict) -> list[dict]:
+    """Return window inventory from the planner environment, regardless of carrier shape."""
+    for key in ("windows", "windowList"):
+        val = env.get(key)
+        if isinstance(val, list):
+            return [w for w in val if isinstance(w, dict)]
+    profile = env.get("profile") if isinstance(env.get("profile"), dict) else {}
+    val = profile.get("windows") or profile.get("windowList")
+    return [w for w in val if isinstance(w, dict)] if isinstance(val, list) else []
+
+
+def _window_anchor_from_environment(prompt: str, environments: list[dict] | None, target: str) -> dict | None:
+    """Resolve a named app/window mention against LIVE twin window inventory.
+
+    This is intentionally data-driven: it does not know about Chrome, VS Code, terminals, etc.
+    It matches prompt tokens against the app/title tokens that `window/query/list` actually
+    observed, then asks the connector to select that window. If no observed window name is
+    mentioned, the env-enum gate remains responsible for asking the user.
+    """
+    prompt_tokens = _text_tokens(prompt)
+    if not prompt_tokens:
+        return None
+    best: tuple[int, int, dict] | None = None
+    for env in environments or []:
+        if str(env.get("node") or target) != target:
+            continue
+        for win in _environment_windows(env):
+            app_tokens = _text_tokens(win.get("app"))
+            title_tokens = _text_tokens(win.get("title"))
+            app_matches = app_tokens & prompt_tokens
+            title_matches = title_tokens & prompt_tokens
+            if not app_matches and not title_matches:
+                continue
+            payload: dict[str, str] = {}
+            if app_matches:
+                payload["app"] = sorted(app_matches, key=lambda s: (-len(s), s))[0]
+            elif title_matches:
+                payload["title"] = sorted(title_matches, key=lambda s: (-len(s), s))[0]
+            score = len(app_matches) * 3 + len(title_matches)
+            has_monitor = 1 if win.get("monitor") is not None or win.get("monitorConnector") else 0
+            candidate = (score, has_monitor, payload)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+    return {"payload": best[2]} if best else None
+
+
+def heuristic_flow(prompt: str, routes: list[dict], nodes: list[dict], selected_nodes: list[str] | None = None,
+                   *, use_llm: bool = True, environments: list[dict] | None = None) -> dict:
     selected = target_nodes(prompt, nodes, selected_nodes)
 
     def selected_route(route: dict) -> bool:
@@ -247,7 +333,16 @@ def heuristic_flow(prompt: str, routes: list[dict], nodes: list[dict], selected_
     steps: list[dict] = []
     previous = None
     for target in targets:
-        previous = _append_target_steps(steps, route_uris, target, intents, path if (intents["files"] or intents["invoices"]) else url, previous)
+        previous = _append_target_steps(
+            steps,
+            route_uris,
+            target,
+            intents,
+            path if (intents["files"] or intents["invoices"]) else url,
+            previous,
+            prompt=prompt,
+            window_anchor=_window_anchor_from_environment(prompt, environments, target),
+        )
 
     # The health probe is a companion to real work, never a result on its own: when the
     # user's actual intent (browser, screen, …) had no available route, every real step is
@@ -428,6 +523,27 @@ def _payload_for_schema_validation(payload: dict, schema: dict) -> dict:
     return out
 
 
+def _canonicalize_template_refs(payload: dict) -> dict:
+    """Convert ``{{step.result...path}}`` mustache-style values into canonical ``<field>_from``
+    data-flow references. Many LLMs (esp. local/coder models) express a data dependency as
+    ``monitor: "{{list_chrome_windows.result.value.selected.monitor}}"`` — that is the SAME intent
+    as ``monitor_from: "list_chrome_windows.result.value.selected.monitor"``, but a raw template
+    string fails the connector's typed schema (``monitor`` must be an int). Accept the convention
+    instead of hard-failing the plan. This is syntax tolerance for the planner — NOT anchor-phrase
+    hard-coding; it widens which models can drive the LLM track, it does not encode any intent."""
+    if not isinstance(payload, dict):
+        return payload
+    out: dict = {}
+    for key, value in payload.items():
+        if isinstance(value, str) and not key.endswith("_from"):
+            m = re.fullmatch(r"\s*\{\{\s*(.+?)\s*\}\}\s*", value)
+            if m:
+                out[f"{key}_from"] = m.group(1)
+                continue
+        out[key] = value
+    return out
+
+
 def _validate_step_payload(uri: str, payload: dict, routes: "list[dict] | None") -> None:
     """Raise ValueError when routes include an inputSchema that payload doesn't satisfy."""
     if not routes:
@@ -459,6 +575,7 @@ def _normalize_flow_step(step: dict, index: int, allowed_uris: set[str], used: s
     """Validate and canonicalize one flow step; `used` tracks taken ids to keep them unique."""
     uri = str(step.get("uri", ""))
     payload = step.get("payload") if isinstance(step.get("payload"), dict) else {}
+    payload = _canonicalize_template_refs(payload)
     if not _uri_is_available(uri, allowed_uris):
         fallback = _fallback_ui_uri_for_unavailable_cdp(uri, allowed_uris)
         if fallback:
@@ -485,6 +602,7 @@ def _normalize_flow_task(task: dict) -> dict:
 
 
 _WINDOW_LIST_SUFFIX = "/window/query/list"
+_WINDOW_FOCUS_SUFFIX = "/window/command/focus"
 _SCREEN_CAPTURE_SUFFIX = "/screen/query/capture"
 
 
@@ -511,16 +629,170 @@ def _capture_scope_conflicts_with_ref(payload: dict) -> bool:
         payload.get("scope") or "").strip().lower() in {"all", "all-monitors", "desktop"}
 
 
-def _bind_window_monitor_capture(steps: list[dict]) -> list[dict]:
-    """Bind window-list results into later screen capture monitor payloads.
+# Declarative env-enum producer→consumer bindings. The window-list → capture.monitor
+# coupling is ONE row, not hardcoded logic: a new env-enum domain (audio sink, camera,
+# cdp endpoint) is one more row, no new code. `domain` mirrors the consumer contract's
+# domain key (`env:monitors.id`) — DATA drives the wiring, not a per-capability rule.
+_ENV_DOMAIN_PRODUCERS = (
+    {"domain": "env:monitors.id", "consumer_suffix": _SCREEN_CAPTURE_SUFFIX,
+     "producer_suffix": _WINDOW_LIST_SUFFIX, "param": "monitor",
+     "path": "result.value.selected.monitor",
+     "skip_scopes": ("all", "all-monitors", "desktop")},
+)
 
-    LLMs often propose the right observation step (`window/query/list`) but leave
-    the capture as `scope: all`. The deterministic flow normalizer wires the data
-    dependency without inferring app names from text: the window query owns window
-    selection, and capture consumes `selected.monitor`.
+
+def _needs_producer(payload: dict, param: str, skip_scopes) -> bool:
+    """Generic form of _capture_needs_window_monitor: a consumer needs a producer for ``param``
+    when no explicit value/ref is set and the scope leaves the env-enum unresolved."""
+    if f"{param}_from" in payload:
+        return False
+    if _positive_int(payload.get(param)):
+        return False
+    scope = str(payload.get("scope") or "").strip().lower()
+    return scope in {"", *skip_scopes} or payload.get(param) in (None, "", 0, -1)
+
+
+def _scope_conflicts_with_producer(payload: dict, param: str, skip_scopes) -> bool:
+    """A ``<param>_from`` ref paired with an all-scope the contract's skipWhen would let override it."""
+    return bool(payload.get(f"{param}_from")) and str(
+        payload.get("scope") or "").strip().lower() in set(skip_scopes)
+
+
+def _wire_env_consumer(step: dict, prior_ids: set, spec: dict, producer_id: str) -> dict:
+    param, skip, pfrom = spec["param"], spec["skip_scopes"], f"{spec['param']}_from"
+    payload = dict(step.get("payload") or {})
+    if _needs_producer(payload, param, skip) or _scope_conflicts_with_producer(payload, param, skip):
+        payload.pop("scope", None)
+        if not _positive_int(payload.get(param)):
+            payload.pop(param, None)
+        if _needs_producer(payload, param, skip):
+            payload[pfrom] = f"{producer_id}.{spec['path']}"
+    # a <param>_from reference REQUIRES its producer declared in depends_on (data dep, not luck)
+    deps = list(step.get("depends_on") or [])
+    if str(payload.get(pfrom) or "").split(".")[0] == producer_id and producer_id in prior_ids \
+            and producer_id not in deps:
+        deps.append(producer_id)
+    return {**step, "payload": payload, "depends_on": deps}
+
+
+def _bind_env_domain_producers(steps: list[dict]) -> list[dict]:
+    """Wire each env-enum CONSUMER param to an earlier PRODUCER of that domain, driven by the
+    declarative _ENV_DOMAIN_PRODUCERS table — no per-capability branching. The window query owns
+    selection; the capture consumes it; a new env-enum is a table row, not a code path."""
+    out: list[dict] = []
+    latest: dict = {}
+    for step in steps:
+        uri = str(step.get("uri") or "")
+        for spec in _ENV_DOMAIN_PRODUCERS:
+            if uri.endswith(spec["producer_suffix"]):
+                latest[spec["producer_suffix"]] = step["id"]
+        for spec in _ENV_DOMAIN_PRODUCERS:
+            producer_id = latest.get(spec["producer_suffix"])
+            if uri.endswith(spec["consumer_suffix"]) and producer_id:
+                step = _wire_env_consumer(step, {s["id"] for s in out}, spec, producer_id)
+        out.append(step)
+    return out
+
+
+def _bind_window_monitor_capture(steps: list[dict]) -> list[dict]:
+    """Back-compat shim: the window-list → capture.monitor binding is now ONE row in
+    _ENV_DOMAIN_PRODUCERS, applied generically by _bind_env_domain_producers."""
+    return _bind_env_domain_producers(steps)
+
+
+def _focus_uri_for_window_uri(window_uri: str, allowed_uris: set[str]) -> str | None:
+    candidate = window_uri.replace(_WINDOW_LIST_SUFFIX, _WINDOW_FOCUS_SUFFIX)
+    if candidate in allowed_uris:
+        return candidate
+    target = route_target(window_uri)
+    for uri in sorted(allowed_uris):
+        if uri.endswith(_WINDOW_FOCUS_SUFFIX) and route_target(uri) == target:
+            return uri
+    return None
+
+
+def _window_focus_selector(step: dict) -> str:
+    payload = step.get("payload") if isinstance(step.get("payload"), dict) else {}
+    return str(payload.get("title") or payload.get("app") or "").strip()
+
+
+def _capture_uses_window_monitor(step: dict, window_step_id: str) -> bool:
+    payload = step.get("payload") if isinstance(step.get("payload"), dict) else {}
+    ref = str(payload.get("monitor_from") or "")
+    return ref.startswith(f"{window_step_id}.")
+
+
+def _generated_step_id(base: str, used: set[str]) -> str:
+    root = slug(base) or "step"
+    candidate = root
+    i = 2
+    while candidate in used:
+        candidate = f"{root}_{i}"
+        i += 1
+    used.add(candidate)
+    return candidate
+
+
+def _depends_on_window_focus(step: dict, steps_by_id: dict[str, dict], window_id: str) -> bool:
+    for dep in step.get("depends_on") or []:
+        dep_step = steps_by_id.get(str(dep))
+        if not dep_step:
+            continue
+        if str(dep_step.get("uri") or "").endswith(_WINDOW_FOCUS_SUFFIX) and window_id in (
+            dep_step.get("depends_on") or []
+        ):
+            return True
+    return False
+
+
+def _dedupe_equivalent_focus_steps(steps: list[dict]) -> list[dict]:
+    seen: dict[tuple, str] = {}
+    replace: dict[str, str] = {}
+    out: list[dict] = []
+    for step in steps:
+        step_id = str(step.get("id") or "")
+        if str(step.get("uri") or "").endswith(_WINDOW_FOCUS_SUFFIX):
+            key = (
+                str(step.get("uri") or ""),
+                json.dumps(step.get("payload") or {}, sort_keys=True),
+                tuple(step.get("depends_on") or []),
+            )
+            if key in seen and step_id:
+                replace[step_id] = seen[key]
+                continue
+            if step_id:
+                seen[key] = step_id
+        out.append(step)
+    if not replace:
+        return out
+    rewritten: list[dict] = []
+    for step in out:
+        deps: list[str] = []
+        for dep in step.get("depends_on") or []:
+            dep = replace.get(str(dep), str(dep))
+            if dep not in deps:
+                deps.append(dep)
+        rewritten.append({**step, "depends_on": deps})
+    return rewritten
+
+
+def _focus_window_before_monitor_capture(steps: list[dict], allowed_uris: set[str]) -> list[dict]:
+    """Raise the window before monitor capture when capture is bound to window/query/list.
+
+    A monitor screenshot records the visible desktop, not the accessibility tree. If the
+    selected app window exists but is covered by another app, `monitor_from` alone picks the
+    right monitor yet still produces the wrong visual evidence. Focus is best-effort in the
+    KVM connector, so this keeps the flow admissible while making screenshots match the NL
+    intent ("screen where Chrome is").
     """
+    steps = _dedupe_equivalent_focus_steps(steps)
+    if not allowed_uris or any("/cdp/" in str(step.get("uri") or "") for step in steps):
+        return steps
+    used = {str(step.get("id") or "") for step in steps if step.get("id")}
+    steps_by_id = {str(step.get("id") or ""): step for step in steps if step.get("id")}
     out: list[dict] = []
     latest_window_step: dict | None = None
+    focus_by_window: dict[str, str] = {}
     for step in steps:
         uri = str(step.get("uri") or "")
         if uri.endswith(_WINDOW_LIST_SUFFIX):
@@ -528,20 +800,29 @@ def _bind_window_monitor_capture(steps: list[dict]) -> list[dict]:
             out.append(step)
             continue
         if uri.endswith(_SCREEN_CAPTURE_SUFFIX) and latest_window_step is not None:
-            payload = dict(step.get("payload") or {})
-            needs = _capture_needs_window_monitor(payload)
-            # The LLM may set monitor_from itself but ALSO leave scope:all — its own WINDOW-MONITOR
-            # RULE violation that would override the resolved monitor and grab every monitor.
-            if needs or _capture_scope_conflicts_with_ref(payload):
-                payload.pop("scope", None)
-                if not _positive_int(payload.get("monitor")):
-                    payload.pop("monitor", None)
-                if needs:
-                    payload["monitor_from"] = f"{latest_window_step['id']}.result.value.selected.monitor"
+            window_id = str(latest_window_step.get("id") or "")
+            selector = _window_focus_selector(latest_window_step)
+            focus_uri = _focus_uri_for_window_uri(str(latest_window_step.get("uri") or ""), allowed_uris)
+            if (
+                window_id and selector and focus_uri
+                and _capture_uses_window_monitor(step, window_id)
+                and not _depends_on_window_focus(step, steps_by_id, window_id)
+            ):
+                focus_id = focus_by_window.get(window_id)
+                if focus_id is None:
+                    focus_id = _generated_step_id(f"focus_{window_id}", used)
+                    focus_by_window[window_id] = focus_id
+                    out.append({
+                        "id": focus_id,
+                        "uri": focus_uri,
+                        "payload": {"title": selector},
+                        "depends_on": [window_id],
+                    })
                 deps = list(step.get("depends_on") or [])
-                if latest_window_step["id"] not in deps:
-                    deps.append(latest_window_step["id"])
-                step = {**step, "payload": payload, "depends_on": deps}
+                deps = [focus_id if dep == window_id else dep for dep in deps]
+                if focus_id not in deps:
+                    deps.append(focus_id)
+                step = {**step, "depends_on": deps}
         out.append(step)
     return out
 
@@ -573,13 +854,15 @@ def _needs_session_ready_after_ensure(prev_uri: str, next_uri: str | None) -> bo
 
 _SCREENSHOT_KWS = frozenset({
     "screenshot", "zrzut ekranu", "zrzut", "screenshota", "printscreen",
-    "screen grab", "capture screen", "snap screen",
+    "screen grab", "capture screen", "capture monitor", "snap screen",
+    "screena", "zrzutuj", "przechwyc", "monitor",
 })
 
 _ALL_MONITOR_KWS = (
     "all monitors", "all screens", "whole desktop", "entire desktop",
     "wszystkie monitory", "wszystkich monitorow", "wszystkich monitorw",
-    "wszystkie ekrany", "caly pulpit", "calego pulpitu",
+    "wszystkie ekrany", "wszystkich ekranow", "wszystkich ekranw",
+    "caly pulpit", "calego pulpitu", "cay desktop", "caego pulpitu",
 )
 
 _MONITOR_ORDINALS = {
@@ -621,6 +904,12 @@ def _screenshot_capture_payload(prompt: str) -> dict:
     m = re.search(r"\bekran\w*\s+(\d+)\s+monitor\w*\b", low)
     if m:
         return {"monitor": max(1, int(m.group(1)))}
+    m = re.search(r"\bekran\w*\s+(\d+)\b|\bscreen\s+(\d+)\b", low)
+    if m:
+        return {"monitor": max(1, int(m.group(1) or m.group(2)))}
+    m = re.search(r"\b(\d+)\s+ekran\w*\b|\b(\d+)\s+screen\b", low)
+    if m:
+        return {"monitor": max(1, int(m.group(1) or m.group(2)))}
     for word, number in _MONITOR_ORDINALS.items():
         if re.search(rf"\b{re.escape(word)}\s+monitor\b|\bmonitor\s+{re.escape(word)}\b", low):
             return {"monitor": number}
@@ -658,6 +947,8 @@ def _inject_capture_if_needed(flow: dict, prompt: str, allowed_uris: set[str]) -
     steps = _prepare_capture_after_required_verify(steps)
     if any(_is_screen_capture_step(s) for s in steps):
         steps = _apply_screenshot_capture_payload(steps, prompt)
+        steps = _focus_window_before_monitor_capture(steps, allowed_uris)
+        steps = _ensure_result_reference_dependencies(steps)
         return {**flow, "steps": _prefer_browser_capture_scope_after_cdp(steps)}
     capture_uri = next(
         (u for u in sorted(allowed_uris) if "screen/query/capture" in u), None
@@ -672,6 +963,8 @@ def _inject_capture_if_needed(flow: dict, prompt: str, allowed_uris: set[str]) -
         "depends_on": deps,
     })
     steps = _prepare_capture_after_required_verify(steps)
+    steps = _focus_window_before_monitor_capture(steps, allowed_uris)
+    steps = _ensure_result_reference_dependencies(steps)
     steps = _prefer_browser_capture_scope_after_cdp(steps)
     return {**flow, "steps": steps}
 
@@ -967,6 +1260,64 @@ def _normalize_result_reference_payloads(steps: list[dict]) -> list[dict]:
     return out
 
 
+def _ensure_result_reference_dependencies(steps: list[dict]) -> list[dict]:
+    """Every ``*_from`` flow reference must name an earlier producer in ``depends_on``.
+
+    This is a structural data-flow invariant, independent of the domain. The LLM may emit
+    ``monitor_from``/``id_from`` correctly but omit the dependency edge; later repair passes
+    can also rewrite capture dependencies. Normalize the edge once, generically, so the
+    router/executor never relies on incidental step order.
+    """
+    literal_from_keys = {"copy_from"}
+    seen: set[str] = set()
+    out: list[dict] = []
+    for step in steps:
+        step_id = str(step.get("id") or "")
+        payload = step.get("payload") if isinstance(step.get("payload"), dict) else {}
+        deps = [str(dep) for dep in (step.get("depends_on") or []) if isinstance(dep, str)]
+        for key, value in payload.items():
+            if not key.endswith("_from") or key in literal_from_keys or not isinstance(value, str):
+                continue
+            ref_id = value.strip().split(".", 1)[0].strip().strip("<>").strip()
+            if ref_id and ref_id in seen and ref_id != step_id and ref_id not in deps:
+                deps.append(ref_id)
+        out.append({**step, "depends_on": deps})
+        if step_id:
+            seen.add(step_id)
+    return out
+
+
+def _assert_result_refs_satisfiable(steps: list[dict]) -> list[dict]:
+    """Final data-flow gate: every ``*_from`` reference must name a step that EXISTS and is EARLIER.
+
+    ``_ensure_result_reference_dependencies`` adds the missing edge for a valid earlier producer, but
+    a reference to an UNKNOWN step (hallucinated/typo'd id) or a LATER step (producer after consumer)
+    is unsatisfiable — at execution it resolves to nothing and the connector silently falls back to a
+    default (the exact ``silent monitor=0`` failure the system forbids). Reject it loudly here so a
+    bad plan fails at normalization, not as a wrong capture. Generic over EVERY ``*_from``, not just
+    ``monitor_from`` — the LLM omits/garbles the edge as a CLASS, not a Chrome special case."""
+    literal_from_keys = {"copy_from"}
+    order = {str(s.get("id") or ""): i for i, s in enumerate(steps)}
+    for i, step in enumerate(steps):
+        payload = step.get("payload") if isinstance(step.get("payload"), dict) else {}
+        sid = str(step.get("id") or "")
+        for key, value in payload.items():
+            if not key.endswith("_from") or key in literal_from_keys or not isinstance(value, str):
+                continue
+            ref = value.strip().split(".", 1)[0].strip().strip("<>").strip()
+            if not ref or ref == sid:
+                continue
+            if ref not in order:
+                raise ValueError(
+                    f"flow step {sid!r} references {key}={value!r} but no step {ref!r} exists "
+                    "(unsatisfiable data-flow reference)")
+            if order[ref] >= i:
+                raise ValueError(
+                    f"flow step {sid!r} references {key}={value!r} but its producer {ref!r} is not "
+                    "earlier (producer must precede consumer)")
+    return steps
+
+
 def normalize_flow(flow: dict, allowed_uris: set[str], routes: list[dict] | None = None,
                    infeasible_constraints: list[dict] | None = None) -> dict:
     task = flow.get("task") if isinstance(flow.get("task"), dict) else {}
@@ -981,7 +1332,10 @@ def normalize_flow(flow: dict, allowed_uris: set[str], routes: list[dict] | None
     steps = _rewrite_cdp_profile_for_auth(steps)
     steps = _inject_cdp_ready_probes(steps, allowed_uris, used, routes=routes)
     steps = _normalize_result_reference_payloads(steps)
-    steps = _bind_window_monitor_capture(steps)
+    steps = _bind_env_domain_producers(steps)
+    steps = _focus_window_before_monitor_capture(steps, allowed_uris)
+    steps = _ensure_result_reference_dependencies(steps)
+    steps = _assert_result_refs_satisfiable(steps)
     return {"task": _normalize_flow_task(task), "steps": steps}
 
 
@@ -1023,8 +1377,9 @@ def normalize_flow_or_explain(
 
 def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
              environments: list[dict] | None = None,
-             retrieval: dict | None = None) -> dict:
-    model = os.getenv("URIRUN_LLM_MODEL") or os.getenv("LLM_MODEL")
+             retrieval: dict | None = None,
+             llm_model: str | None = None) -> dict:
+    model = _configured_llm_model(llm_model)
     if not model:
         raise RuntimeError("URIRUN_LLM_MODEL or LLM_MODEL is not set")
 
@@ -1084,7 +1439,7 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
                 "GATE VERIFY: when a verify step checks for login/presence of a UI element that is REQUIRED for the next action (e.g. 'Zacznij publikację' before clicking Publish), add {\"required\": true} to the verify payload — this fails the flow early when not logged in, instead of continuing into failing click steps. "
                 "LOGIN PROFILE: when the task requires being logged in to a service (LinkedIn, Google, GitHub…), set {\"copy_from\": \"~/.config/google-chrome\"} (the user-data-dir ROOT, not the Default subdir) in the cdp/session/command/ensure payload — this CLONES the saved session cookies into a dedicated CDP profile so Chrome opens already logged in WITHOUT fighting the live profile's lock. Do NOT set user_data_dir to the live profile (it launches over the SingletonLock and copies no cookies → login wall); never use an empty or temp profile for tasks that require authentication. "
                 "SCREENSHOT RULE: when the request contains 'screenshot', 'zrzut ekranu', 'capture', 'snap' or similar, the LAST step MUST be screen/query/capture — ALWAYS, regardless of login state, page content, or what verify found. Never substitute a log note for a screenshot step. "
-                "WINDOW-MONITOR RULE: when the request asks for the monitor/screen that contains a named app/window/browser, first use window/query/list with the app or title field grounded from the request, then make screen/query/capture depend on that step and set monitor_from to the real prior step id plus '.result.value.selected.monitor', for example 'list_chrome_windows.result.value.selected.monitor'. Do not use scope:'all' for a single-monitor request tied to an app/window. "
+                "WINDOW-MONITOR RULE: when the request asks for the monitor/screen that contains a named app/window/browser, add a window/query/list step (with that app or title) BEFORE screen/query/capture. The runtime then wires the captured monitor from the window selection automatically — do NOT set monitor_from, depends_on or scope yourself; just emit the window/query/list step and a plain screen/query/capture. "
                 # Concrete-state grounding: when an 'environments' field is present it is the LIVE
                 # capability profile + foreground surface of each node — GROUND your steps on it:
                 "honour each node's 'bestSurface' and ALL items in its 'guidance' list (they are "
@@ -1174,6 +1529,44 @@ def _append_session_guidance(ctx: dict, session_map: dict) -> None:
 
 # ── KVM read helpers (shared by planner and execution self-heal) ──────────────
 
+def _inproc_category(env: dict) -> str:
+    return (env.get("error") or {}).get("category") or ""
+
+
+def _inproc_result(env: dict) -> dict:
+    val = (env.get("result") or {}).get("value") if isinstance(env.get("result"), dict) else None
+    return {"ok": bool(env.get("ok")), "result": val,
+            "error": (env.get("error") or {}).get("message") if not env.get("ok") else None}
+
+
+def _local_inprocess_query(uri: str, payload: dict | None = None) -> dict | None:
+    """Resolve a local planner query through installed connector entry points.
+
+    Host planner probes must not route through a stale mesh serviceMap entry such as
+    ``host -> http://host:8080/run``. They are read-only facts about the local process
+    environment, so prefer the installed local connector when it owns the URI.
+    """
+    try:
+        import urirun as _u  # noqa: PLC0415
+        from urirun.runtime import discovery as _disc, v2 as _v2  # noqa: PLC0415
+        reg = _disc.registry_for_uri(uri, "urirun.bindings")
+        env = _u.run(uri, reg, payload=dict(payload or {}),
+                     mode="execute", policy={"allowExecute": True})
+        if _inproc_category(env) != "NOT_FOUND":
+            return _inproc_result(env)
+        live_binding = _v2.decorated_bindings()["bindings"].get(uri)
+        if live_binding is None:
+            return None
+        reg2 = _u.compile_registry(_v2.build_binding_document([live_binding]))
+        env = _u.run(uri, reg2, payload=dict(payload or {}),
+                     mode="execute", policy={"allowExecute": True})
+        if _inproc_category(env) == "NOT_FOUND":
+            return None
+        return _inproc_result(env)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "result": None, "error": str(exc)}
+
+
 def _fetch_kvm_query(step: dict, registry: dict, route: str, marker: str) -> dict | None:
     """Best-effort fetch of a kvm read-only query (env/query/profile, surface/query/current)
     for the failing node, so the self-heal fits its remediation to the live machine + surface.
@@ -1186,9 +1579,13 @@ def _fetch_kvm_query(step: dict, registry: dict, route: str, marker: str) -> dic
     if routed and routed not in candidates:
         candidates.append(routed)
     if target == "host":
-        # For host-targeted calls keep the historical direct path only. A remote node can
-        # advertise kvm://host/...; callers that mean that node pass kvm://<node>/... and
-        # get routed through the registry metadata fallback above.
+        local = _local_inprocess_query(candidates[0], {})
+        value = result_data(local) if isinstance(local, dict) else None
+        if isinstance(value, dict) and marker in value:
+            return value
+        # For host-targeted calls keep the historical direct path only after the local
+        # in-process probe. A remote node can advertise kvm://host/...; callers that mean
+        # that node pass kvm://<node>/... and get routed through registry metadata above.
         candidates = candidates[:1]
     for uri in candidates:
         try:
@@ -1249,6 +1646,9 @@ def fetch_planner_environments(node_names: list[str], registry: dict, mesh: dict
                 continue
             surf = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "surface/query/current", "kind")
             ctx = planner_context(name, prof, surf, memory=memory)
+            win = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "window/query/list", "windows")
+            if isinstance(win, dict):
+                ctx["windows"] = [w for w in (win.get("windows") or []) if isinstance(w, dict)]
             # Task-aware session discovery: scan running browsers and installed profiles so the
             # planner knows which browser/profile is logged in to which service. Cheap, non-blocking.
             browser_sess = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "browser/query/sessions", "browsers")
@@ -1270,29 +1670,78 @@ def fetch_planner_environments(node_names: list[str], registry: dict, mesh: dict
 
 # ── Top-level flow generation entry point ────────────────────────────────────
 
+def _safe_planner_error(exc: BaseException) -> str:
+    msg = str(exc).strip() or type(exc).__name__
+    msg = re.sub(r"https?://\S+", "<url>", msg)
+    msg = re.sub(r"keys/[A-Za-z0-9._:-]+", "keys/<redacted>", msg)
+    msg = " ".join(msg.split())
+    return msg[:500]
+
+
+def _flow_from_retrieval(retrieval: dict | None) -> dict | None:
+    """Build a flow from the best known-good retrieval candidate, or None when there is none.
+
+    Recall is the planner's FALLBACK before the hardcoded heuristic: a known-good episode beats a
+    hand-written per-intent URI sequence. It is material, not a literal replay — the normalize
+    pipeline (env_selection / _bind_env_domain_producers) re-resolves env-enum values (monitor, …)
+    against the CURRENT inventory, so a stale episode value cannot leak (Gen 6)."""
+    if not isinstance(retrieval, dict):
+        return None
+    for key in ("flows", "episodes"):
+        for cand in (retrieval.get(key) or []):
+            steps = cand.get("steps") if isinstance(cand, dict) else None
+            if steps:
+                return {"steps": list(steps),
+                        "task": {"id": "recall", "source": "recall-fallback",
+                                 "title": str(cand.get("intent") or cand.get("prompt") or "")}}
+    return None
+
+
 def make_flow(prompt: str, mesh: dict, selected_nodes: list[str] | None = None, use_llm: bool = True,
               environments: list[dict] | None = None,
-              retrieval: dict | None = None) -> tuple[dict, dict]:
+              retrieval: dict | None = None,
+              llm_model: str | None = None) -> tuple[dict, dict]:
     routes = [route for route in mesh["routes"] if safe_route(route)]
     allowed = {route["uri"] for route in routes}
     if use_llm:
         try:
+            resolved_model = _configured_llm_model(llm_model)
             flow = normalize_flow_or_explain(
-                llm_flow(prompt, routes, mesh["nodes"], environments=environments, retrieval=retrieval),
+                llm_flow(prompt, routes, mesh["nodes"], environments=environments,
+                         retrieval=retrieval, llm_model=llm_model),
                 allowed,
                 routes=routes,
                 selected_nodes=selected_nodes,
                 environments=environments,
             )
-            return flow, {"provider": "litellm", "fallback": False}
-        except Exception as exc:  # noqa: BLE001 - return a controlled planner error unless fallback is explicit.
-            if os.getenv("URIRUN_ALLOW_HEURISTIC_PLANNER_FALLBACK", "").strip().lower() not in {"1", "true", "yes"}:
+            return flow, {"provider": "litellm", "fallback": False,
+                          **({"model": resolved_model} if resolved_model else {})}
+        except Exception as exc:  # noqa: BLE001 - LLM leads; the heuristic is the explicit fallback.
+            # Inverted planner policy: the LLM planner LEADS, and the deterministic heuristic is an
+            # explicit, configurable fallback that is ON BY DEFAULT. So an LLM outage (no credits,
+            # rate-limit, unreachable local model) DEGRADES to a heuristic plan instead of a hard
+            # planner-error — the operator still gets a (possibly needs-selection) result, not a wall.
+            # Opt into loud failure with URIRUN_STRICT_LLM_PLANNER=1 (e.g. CI that must not silently
+            # degrade); legacy URIRUN_ALLOW_HEURISTIC_PLANNER_FALLBACK=0 also forces strict.
+            _strict = os.getenv("URIRUN_STRICT_LLM_PLANNER", "").strip().lower() in {"1", "true", "yes"}
+            if os.getenv("URIRUN_ALLOW_HEURISTIC_PLANNER_FALLBACK", "").strip().lower() in {"0", "false", "no"}:
+                _strict = True
+            if _strict:
+                detail = _safe_planner_error(exc)
                 raise RuntimeError(
-                    "LLM planner failed and heuristic fallback is disabled. "
-                    "Configure URIRUN_LLM_MODEL/LLM_MODEL, pass noLlm=true for explicit "
-                    "offline diagnostics, or set URIRUN_ALLOW_HEURISTIC_PLANNER_FALLBACK=1."
+                    "LLM planner failed and strict mode is on (URIRUN_STRICT_LLM_PLANNER). "
+                    f"Planner error: {detail}. "
+                    "Configure URIRUN_LLM_MODEL/LLM_MODEL, pass noLlm=true for explicit offline "
+                    "diagnostics, or unset URIRUN_STRICT_LLM_PLANNER to degrade to the heuristic."
                 ) from exc
-            flow = heuristic_flow(prompt, routes, mesh["nodes"], selected_nodes, use_llm=True)
+            recalled = _flow_from_retrieval(retrieval)
+            if recalled is not None:
+                flow = normalize_flow_or_explain(recalled, allowed, routes=routes,
+                    selected_nodes=selected_nodes, planner_reason=str(exc), environments=environments)
+                return _inject_capture_if_needed(flow, prompt, allowed), {
+                    "provider": "recall", "fallback": True, "reason": _safe_planner_error(exc)}
+            flow = heuristic_flow(prompt, routes, mesh["nodes"], selected_nodes,
+                                  use_llm=True, environments=environments)
             flow = normalize_flow_or_explain(
                 flow,
                 allowed,
@@ -1301,8 +1750,16 @@ def make_flow(prompt: str, mesh: dict, selected_nodes: list[str] | None = None, 
                 planner_reason=str(exc),
                 environments=environments,
             )
-            return _inject_capture_if_needed(flow, prompt, allowed), {"provider": "heuristic", "fallback": True, "reason": str(exc)}
-    flow = heuristic_flow(prompt, routes, mesh["nodes"], selected_nodes, use_llm=False)
+            return _inject_capture_if_needed(flow, prompt, allowed), {
+                "provider": "heuristic", "fallback": True, "reason": _safe_planner_error(exc)}
+    recalled = _flow_from_retrieval(retrieval)
+    if recalled is not None:
+        flow = normalize_flow_or_explain(recalled, allowed, routes=routes,
+            selected_nodes=selected_nodes, planner_reason="LLM disabled", environments=environments)
+        return _inject_capture_if_needed(flow, prompt, allowed), {
+            "provider": "recall", "fallback": True, "reason": "LLM disabled"}
+    flow = heuristic_flow(prompt, routes, mesh["nodes"], selected_nodes,
+                          use_llm=False, environments=environments)
     flow = normalize_flow_or_explain(
         flow,
         allowed,

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from urirun_flow import flow_planner as planner
 from urirun_flow.flow import (
     _build_thin_plan,
     _build_env_inventory,
@@ -16,7 +17,13 @@ from urirun_flow.flow import (
     _uri_matches_template,
     _uri_segments,
 )
-from urirun_flow.flow_planner import heuristic_flow, make_flow, normalize_flow, prepare_screenshot_capture_flow
+from urirun_flow.flow_planner import (
+    _safe_planner_error,
+    heuristic_flow,
+    make_flow,
+    normalize_flow,
+    prepare_screenshot_capture_flow,
+)
 
 
 # ─── first_url ───────────────────────────────────────────────────────────────
@@ -208,6 +215,41 @@ def test_normalize_strips_conflicting_scope_all_when_llm_set_monitor_from():
     assert "monitor" not in capture["payload"]        # the placeholder monitor:-1 is gone
     assert capture["payload"]["monitor_from"] == "list_chrome_windows.result.value.selected.monitor"
     assert capture["depends_on"] == ["list_chrome_windows"]
+
+
+def test_normalize_adds_dependency_for_llm_monitor_from_reference():
+    allowed = {"kvm://host/window/query/list", "kvm://host/screen/query/capture"}
+    routes = [
+        {"uri": "kvm://host/window/query/list",
+         "inputSchema": {"type": "object", "properties": {"app": {"type": "string"}},
+                         "additionalProperties": False}},
+        {"uri": "kvm://host/screen/query/capture",
+         "inputSchema": {"type": "object",
+                         "properties": {"monitor": {"type": "integer"}, "monitor_from": {"type": "string"}},
+                         "additionalProperties": False}},
+    ]
+    flow = {
+        "task": {"id": "shot"},
+        "steps": [
+            {"id": "list_chrome_windows", "uri": "kvm://host/window/query/list",
+             "payload": {"app": "chrome"}, "depends_on": []},
+            {"id": "capture_chrome_monitor", "uri": "kvm://host/screen/query/capture",
+             "payload": {"monitor_from": "list_chrome_windows.result.value.selected.monitor"},
+             "depends_on": []},
+        ],
+    }
+
+    capture = normalize_flow(flow, allowed, routes=routes)["steps"][1]
+
+    assert capture["depends_on"] == ["list_chrome_windows"]
+
+
+def test_safe_planner_error_redacts_urls_and_key_fragments():
+    err = RuntimeError("Insufficient credits: https://openrouter.ai/settings/credits keys/secret123")
+    msg = _safe_planner_error(err)
+    assert "https://" not in msg
+    assert "secret123" not in msg
+    assert "Insufficient credits" in msg
 
 
 def test_normalize_rejects_unknown_result_reference_against_strict_schema():
@@ -457,7 +499,9 @@ def test_make_flow_no_llm_adds_all_monitor_payload_to_kvm_capture():
     assert flow["steps"][0]["payload"] == {"scope": "all", "monitor": -1}
 
 
-def test_make_flow_llm_mode_does_not_silently_fallback_to_heuristics(monkeypatch):
+def test_make_flow_llm_outage_degrades_to_heuristic_by_default(monkeypatch):
+    # Inverted planner policy: the LLM leads, but a planner outage (here: no model configured)
+    # DEGRADES to the deterministic heuristic by default — the operator gets a result, not a wall.
     mesh = {
         "nodes": [{"name": "host", "reachable": True}],
         "routes": [{"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True}],
@@ -465,9 +509,60 @@ def test_make_flow_llm_mode_does_not_silently_fallback_to_heuristics(monkeypatch
     monkeypatch.delenv("URIRUN_LLM_MODEL", raising=False)
     monkeypatch.delenv("LLM_MODEL", raising=False)
     monkeypatch.delenv("URIRUN_ALLOW_HEURISTIC_PLANNER_FALLBACK", raising=False)
+    monkeypatch.delenv("URIRUN_STRICT_LLM_PLANNER", raising=False)
 
-    with pytest.raises(RuntimeError, match="heuristic fallback is disabled"):
+    flow, generator = make_flow("zrob zrzut ekranu", mesh, use_llm=True)
+    assert generator["provider"] == "heuristic"
+    assert generator["fallback"] is True
+
+
+def test_make_flow_llm_outage_raises_only_in_strict_mode(monkeypatch):
+    # Opt-in loud failure for callers that must not silently degrade (e.g. CI measuring the LLM).
+    mesh = {
+        "nodes": [{"name": "host", "reachable": True}],
+        "routes": [{"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True}],
+    }
+    monkeypatch.delenv("URIRUN_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setenv("URIRUN_STRICT_LLM_PLANNER", "1")
+
+    with pytest.raises(RuntimeError, match="strict mode"):
         make_flow("zrob zrzut ekranu", mesh, use_llm=True)
+
+
+def test_make_flow_llm_model_override_is_passed_to_provider(monkeypatch):
+    mesh = {
+        "nodes": [{"name": "host", "reachable": True}],
+        "routes": [{"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True}],
+    }
+    captured = {}
+
+    class _Message:
+        content = (
+            '{"task":{"id":"shot"},"steps":[{"id":"cap",'
+            '"uri":"kvm://host/screen/query/capture","payload":{},"depends_on":[]}]}'
+        )
+
+    class _Choice:
+        message = _Message()
+
+    class _Response:
+        choices = [_Choice()]
+
+    def fake_completion(*, model, messages, **kwargs):
+        captured["model"] = model
+        captured["messages"] = messages
+        return _Response()
+
+    monkeypatch.delenv("URIRUN_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.setattr(planner, "quiet_completion", fake_completion)
+
+    flow, generator = make_flow("zrob zrzut ekranu", mesh, use_llm=True, llm_model="request/model")
+
+    assert captured["model"] == "request/model"
+    assert generator["model"] == "request/model"
+    assert flow["steps"][0]["uri"] == "kvm://host/screen/query/capture"
 
 
 def test_thin_plan_injects_inventory_beside_drift_for_kvm_steps():
@@ -565,3 +660,249 @@ def test_desktop_screenshot_without_cdp_keeps_os_capture_scope():
     repaired = prepare_screenshot_capture_flow(flow, "zrob zrzut ekranu pulpitu", set())
 
     assert "scope" not in repaired["steps"][0]["payload"]
+
+
+def test_window_monitor_capture_focuses_window_before_screenshot_when_route_available():
+    flow = {
+        "steps": [
+            {
+                "id": "list_chrome_windows",
+                "uri": "kvm://host/window/query/list",
+                "payload": {"app": "chrome"},
+                "depends_on": [],
+            },
+            {
+                "id": "capture_chrome_screen",
+                "uri": "kvm://host/screen/query/capture",
+                "payload": {"monitor_from": "list_chrome_windows.result.value.selected.monitor"},
+                "depends_on": ["list_chrome_windows"],
+            },
+        ]
+    }
+    repaired = prepare_screenshot_capture_flow(flow, "zrob zrzut monitora z chrome", {
+        "kvm://host/window/query/list",
+        "kvm://host/window/command/focus",
+        "kvm://host/screen/query/capture",
+    })
+
+    assert [step["id"] for step in repaired["steps"]] == [
+        "list_chrome_windows",
+        "focus_list_chrome_windows",
+        "capture_chrome_screen",
+    ]
+    assert repaired["steps"][1]["uri"] == "kvm://host/window/command/focus"
+    assert repaired["steps"][1]["payload"] == {"title": "chrome"}
+    assert repaired["steps"][2]["depends_on"] == ["focus_list_chrome_windows", "list_chrome_windows"]
+
+    repaired_again = prepare_screenshot_capture_flow(repaired, "zrob zrzut monitora z chrome", {
+        "kvm://host/window/query/list",
+        "kvm://host/window/command/focus",
+        "kvm://host/screen/query/capture",
+    })
+    assert [step["id"] for step in repaired_again["steps"]] == [
+        "list_chrome_windows",
+        "focus_list_chrome_windows",
+        "capture_chrome_screen",
+    ]
+
+
+def test_window_monitor_capture_does_not_inject_focus_without_focus_route():
+    flow = {
+        "steps": [
+            {
+                "id": "list_chrome_windows",
+                "uri": "kvm://host/window/query/list",
+                "payload": {"app": "chrome"},
+                "depends_on": [],
+            },
+            {
+                "id": "capture_chrome_screen",
+                "uri": "kvm://host/screen/query/capture",
+                "payload": {"monitor_from": "list_chrome_windows.result.value.selected.monitor"},
+                "depends_on": ["list_chrome_windows"],
+            },
+        ]
+    }
+    repaired = prepare_screenshot_capture_flow(flow, "zrob zrzut monitora z chrome", {
+        "kvm://host/window/query/list",
+        "kvm://host/screen/query/capture",
+    })
+
+    assert [step["id"] for step in repaired["steps"]] == ["list_chrome_windows", "capture_chrome_screen"]
+
+
+def test_window_monitor_capture_collapses_duplicate_focus_steps_from_recall():
+    flow = {
+        "steps": [
+            {"id": "list_chrome_windows", "uri": "kvm://host/window/query/list",
+             "payload": {"app": "chrome"}, "depends_on": []},
+            {"id": "focus_list_chrome_windows", "uri": "kvm://host/window/command/focus",
+             "payload": {"title": "chrome"}, "depends_on": ["list_chrome_windows"]},
+            {"id": "focus_list_chrome_windows_2", "uri": "kvm://host/window/command/focus",
+             "payload": {"title": "chrome"}, "depends_on": ["list_chrome_windows"]},
+            {"id": "capture_chrome_screen", "uri": "kvm://host/screen/query/capture",
+             "payload": {"monitor_from": "list_chrome_windows.result.value.selected.monitor"},
+             "depends_on": ["focus_list_chrome_windows", "focus_list_chrome_windows_2"]},
+        ]
+    }
+    repaired = prepare_screenshot_capture_flow(flow, "zrob zrzut monitora z chrome", {
+        "kvm://host/window/query/list",
+        "kvm://host/window/command/focus",
+        "kvm://host/screen/query/capture",
+    })
+
+    assert [step["id"] for step in repaired["steps"]] == [
+        "list_chrome_windows",
+        "focus_list_chrome_windows",
+        "capture_chrome_screen",
+    ]
+    assert repaired["steps"][2]["depends_on"] == ["focus_list_chrome_windows", "list_chrome_windows"]
+
+
+def test_normalize_wires_depends_on_for_clean_monitor_from():
+    """Regression (found live): the LLM routinely emits a CLEAN monitor_from (no scope:all)
+    but forgets depends_on. The normalizer must still declare the data dependency — a
+    monitor_from reference requires its producer in depends_on, not luck of step order."""
+    allowed = {"kvm://host/window/query/list", "kvm://host/screen/query/capture"}
+    routes = [
+        {"uri": "kvm://host/window/query/list",
+         "inputSchema": {"type": "object", "properties": {"app": {"type": "string"}},
+                         "additionalProperties": False}},
+        {"uri": "kvm://host/screen/query/capture",
+         "inputSchema": {"type": "object", "properties": {"monitor": {"type": "integer"}},
+                         "additionalProperties": False}},
+    ]
+    flow = {"task": {"id": "shot"}, "steps": [
+        {"id": "list_chrome_windows", "uri": "kvm://host/window/query/list",
+         "payload": {"app": "chrome"}, "depends_on": []},
+        {"id": "capture_chrome_monitor", "uri": "kvm://host/screen/query/capture",
+         "payload": {"monitor_from": "list_chrome_windows.result.value.selected.monitor"},
+         "depends_on": []},
+    ]}
+    capture = normalize_flow(flow, allowed, routes=routes)["steps"][1]
+    assert capture["depends_on"] == ["list_chrome_windows"]
+    assert capture["payload"]["monitor_from"] == "list_chrome_windows.result.value.selected.monitor"
+
+
+def test_heuristic_uses_window_inventory_for_named_monitor_anchor():
+    routes = [
+        {"uri": "kvm://host/window/query/list", "node": "host", "safe": True},
+        {"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True},
+    ]
+    nodes = [{"name": "host"}]
+    environments = [{
+        "node": "host",
+        "windows": [{"app": "Google Chrome", "title": "LinkedIn - Google Chrome", "monitor": 2}],
+    }]
+
+    flow = heuristic_flow(
+        "zrób zrzut ekranu monitora, na którym jest chrome",
+        routes,
+        nodes,
+        selected_nodes=["host"],
+        use_llm=False,
+        environments=environments,
+    )
+
+    assert [s["uri"] for s in flow["steps"]] == [
+        "kvm://host/window/query/list",
+        "kvm://host/screen/query/capture",
+    ]
+    assert flow["steps"][0]["payload"] == {"app": "chrome"}
+    assert flow["steps"][1]["payload"] == {
+        "monitor_from": "kvm_host_window_query_list.result.value.selected.monitor"
+    }
+    assert flow["steps"][1]["depends_on"] == ["kvm_host_window_query_list"]
+
+
+def test_heuristic_does_not_invent_window_anchor_when_inventory_has_no_match():
+    routes = [
+        {"uri": "kvm://host/window/query/list", "node": "host", "safe": True},
+        {"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True},
+    ]
+    nodes = [{"name": "host"}]
+    environments = [{"node": "host", "windows": [{"app": "VSCodium", "title": "README.md"}]}]
+
+    flow = heuristic_flow(
+        "zrób zrzut ekranu monitora, na którym jest chrome",
+        routes,
+        nodes,
+        selected_nodes=["host"],
+        use_llm=False,
+        environments=environments,
+    )
+
+    assert [s["uri"] for s in flow["steps"]] == ["kvm://host/screen/query/capture"]
+    assert flow["steps"][0]["payload"] == {}
+
+
+def test_fetch_kvm_query_prefers_local_inprocess_for_host(monkeypatch):
+    calls = []
+
+    def fake_local(uri, payload):
+        calls.append(("local", uri, payload))
+        return {"ok": True, "result": {"windows": [{"app": "Google Chrome", "monitor": 2}]}}
+
+    def fake_mesh(*args, **kwargs):  # pragma: no cover - should not be called
+        calls.append(("mesh", args, kwargs))
+        return {"ok": False, "error": {"type": "transport"}}
+
+    monkeypatch.setattr(planner, "_local_inprocess_query", fake_local)
+    monkeypatch.setattr(planner.v2_service, "call", fake_mesh)
+
+    value = planner._fetch_kvm_query(
+        {"uri": "kvm://host/x"},
+        {"routes": []},
+        "window/query/list",
+        "windows",
+    )
+
+    assert value == {"windows": [{"app": "Google Chrome", "monitor": 2}]}
+    assert calls == [("local", "kvm://host/window/query/list", {})]
+
+
+def test_env_domain_binding_is_table_driven():
+    """Step-1 refactor: the window-list -> capture.monitor coupling is no longer hardcoded
+    logic but ONE row in _ENV_DOMAIN_PRODUCERS. A new env-enum domain is a table row, not a
+    code path — proven by registering a temp spec and seeing it wire with no new code."""
+    from urirun_flow import flow_planner as fp
+    assert any(s["domain"] == "env:monitors.id" for s in fp._ENV_DOMAIN_PRODUCERS)
+    # monitor still wires exactly as before, via the generic table-driven binder
+    steps = [
+        {"id": "list_w", "uri": "kvm://host/window/query/list", "payload": {"app": "chrome"}},
+        {"id": "cap", "uri": "kvm://host/screen/query/capture", "payload": {"monitor": -1, "scope": "all"}},
+    ]
+    cap = fp._bind_env_domain_producers(steps)[1]
+    assert cap["payload"]["monitor_from"] == "list_w.result.value.selected.monitor"
+    assert cap["depends_on"] == ["list_w"] and "scope" not in cap["payload"]
+    # a brand-new env-enum domain wires generically with zero new logic
+    saved = fp._ENV_DOMAIN_PRODUCERS
+    try:
+        fp._ENV_DOMAIN_PRODUCERS = (*saved, {
+            "domain": "env:audio_sinks.id", "consumer_suffix": "/audio/command/play",
+            "producer_suffix": "/audio/query/list", "param": "sink",
+            "path": "result.value.selected.sink", "skip_scopes": ("all",)})
+        s2 = [{"id": "list_s", "uri": "snd://host/audio/query/list", "payload": {}},
+              {"id": "play", "uri": "snd://host/audio/command/play", "payload": {"scope": "all"}}]
+        play = fp._bind_env_domain_producers(s2)[1]
+        assert play["payload"]["sink_from"] == "list_s.result.value.selected.sink"
+        assert play["depends_on"] == ["list_s"]
+    finally:
+        fp._ENV_DOMAIN_PRODUCERS = saved
+
+
+def test_recall_is_planner_fallback_before_heuristic():
+    """Step-4: a known-good retrieval candidate is the planner fallback BEFORE the hardcoded
+    heuristic (recall is material, the heuristic is last resort). The no-retrieval path is
+    unchanged, so the offline harness keeps measuring the same thing."""
+    from urirun_flow.flow_planner import _flow_from_retrieval, make_flow
+    assert _flow_from_retrieval(None) is None and _flow_from_retrieval({}) is None
+    retr = {"flows": [{"steps": [{"id": "s1", "uri": "env://host/runtime/query/health", "payload": {}}]}],
+            "episodes": []}
+    assert _flow_from_retrieval(retr)["task"]["source"] == "recall-fallback"
+    mesh = {"routes": [{"uri": "env://host/runtime/query/health", "kind": "query", "safe": True}],
+            "nodes": [{"name": "host"}]}
+    _, gen_recall = make_flow("sprawdz health", mesh, use_llm=False, retrieval=retr)
+    _, gen_heur = make_flow("sprawdz health", mesh, use_llm=False, retrieval=None)
+    assert gen_recall["provider"] == "recall"
+    assert gen_heur["provider"] == "heuristic"

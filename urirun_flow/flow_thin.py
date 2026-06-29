@@ -506,7 +506,7 @@ def _irreversible_skip(step: dict, uri: str, results: dict, timeline: list, sid:
 
 
 def _thin_dispatch_step(step: dict, envelope: FlowEnvelope, dispatch_uri,
-                        timeline: list, results: dict) -> "dict | object":
+                        timeline: list, results: dict, *, execute: bool) -> "dict | object":
     """Execute one step and return:
     - an early-exit dict  (flow abort — caller must return it)
     - _DISPATCH_BREAK     (flow is done — caller must break)
@@ -526,7 +526,25 @@ def _thin_dispatch_step(step: dict, envelope: FlowEnvelope, dispatch_uri,
     if irr_skip is not None:
         return irr_skip
 
-    payload = resolve_step_payload(step.get("payload") or {}, results)
+    try:
+        payload = resolve_step_payload(step.get("payload") or {}, results)
+    except KeyError as exc:
+        if execute:
+            raise
+        r = {
+            "ok": True,
+            "dryRun": True,
+            "unresolved": True,
+            "unresolvedReference": str(exc),
+            "payload": step.get("payload") or {},
+            "next": {"kind": "continue"},
+        }
+        envelope.record(uri, "return", ok=True, next="continue", dryRun=True, unresolved=True)
+        timeline.append(_thin_step_entry(sid, uri, r))
+        timeline[-1]["dryRun"] = True
+        timeline[-1]["unresolved"] = True
+        results[sid] = r
+        return _DISPATCH_CONTINUE
     if "/memory/command/remember" in uri:
         payload = _enrich_remember_with_degraded(payload, results, timeline=timeline)
     envelope.record(uri, "call")
@@ -590,7 +608,7 @@ def _thin_driver(
         if brk is not None:
             return brk
         envelope.position = i
-        outcome = _thin_dispatch_step(step, envelope, dispatch_uri, timeline, results)
+        outcome = _thin_dispatch_step(step, envelope, dispatch_uri, timeline, results, execute=execute)
         if outcome is _DISPATCH_BREAK:
             break
         if outcome is not _DISPATCH_CONTINUE:
