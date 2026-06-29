@@ -8,6 +8,7 @@ concrete payload or a typed ``needs-selection`` request.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any, Callable
 
 
@@ -136,6 +137,24 @@ def _option_value_keys(options: list[dict]) -> set[Any]:
     return {_value_key(opt.get("value")) for opt in options}
 
 
+def _nl_key(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(text or ""))
+    ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    ascii_text = ascii_text.translate(str.maketrans({"ł": "l", "Ł": "L"}))
+    return ascii_text.casefold()
+
+
+def _prompt_requests_primary(prompt: str) -> bool:
+    return bool(re.search(r"\b(primary|main|glown\w*)\b", _nl_key(prompt)))
+
+
+def _primary_option_value(options: list[dict]) -> Any:
+    for opt in options:
+        if opt.get("primary"):
+            return opt.get("value")
+    return None
+
+
 def _env_domain_invalid(uri: str, node: str, param: str, cfg: dict, value: Any,
                         options: list[dict]) -> dict:
     return {
@@ -219,7 +238,7 @@ def recall_env_enum_replan_required(flow: dict, routes: list[dict],
 
 
 def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dict] | list[dict],
-                      memory: Any = None) -> dict:
+                      memory: Any = None, prompt: str = "") -> dict:
     """Return ``{ok, flow, decisions}`` or ``needs-selection`` for unresolved env enums."""
     decisions: list[dict] = []
     out_steps: list[dict] = []
@@ -256,6 +275,12 @@ def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dic
                 decisions.append({"uri": uri, "parameter": param, "source": "remembered",
                                   "value": pref_value})
                 continue
+            primary_value = _primary_option_value(options) if _prompt_requests_primary(prompt) else None
+            if primary_value in _option_values(options):
+                payload[param] = primary_value
+                decisions.append({"uri": uri, "parameter": param, "source": "primary",
+                                  "value": primary_value})
+                continue
             if len(options) > 1:
                 return {**_needs_selection(uri, node, param, cfg, options, inventory), "flow": flow}
             decisions.append({"uri": uri, "parameter": param, "source": "unresolved"})
@@ -270,6 +295,7 @@ def resolve_flow_env_enums(
     memory: Any = None,
     inventories: dict[str, dict] | list[dict] | None = None,
     inventory_builder: Callable[[str], dict] | None = None,
+    prompt: str = "",
 ) -> dict:
     """Resolve env enum slots for a whole flow and attach the inventory used."""
     if not flow_route_domains(flow, routes):
@@ -279,5 +305,5 @@ def resolve_flow_env_enums(
         if inventories is not None
         else build_env_enum_inventories(flow, routes, inventory_builder=inventory_builder)
     )
-    result = resolve_env_enums(flow, routes, resolved_inventories or {}, memory=memory)
+    result = resolve_env_enums(flow, routes, resolved_inventories or {}, memory=memory, prompt=prompt)
     return {**result, "inventories": resolved_inventories or {}}

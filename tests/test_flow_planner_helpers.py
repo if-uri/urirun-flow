@@ -729,6 +729,26 @@ def test_fetch_planner_environments_accepts_env_inventory_alias(monkeypatch):
     assert envs[0]["inventory"]["domains"]["env:monitors.id"][0]["value"] == 1
 
 
+def test_fetch_planner_environments_adds_inventory_on_kvm_fallback(monkeypatch):
+    def fake_fetch(step, registry, route, marker):
+        if route == "env/query/profile":
+            return {"controlStrategies": {"atspi": True}, "best": "atspi"}
+        if route == "surface/query/current":
+            return {"kind": "desktop"}
+        return None
+
+    monkeypatch.setattr(planner, "_twin_host_query", lambda *a, **k: None)
+    monkeypatch.setattr(planner, "_fetch_kvm_query", fake_fetch)
+    monkeypatch.setattr(planner, "_kvm_inventory_for_planner", lambda node, registry: {
+        "node": node,
+        "domains": {"env:monitors.id": [{"value": 2, "primary": True}]},
+    })
+
+    envs = planner.fetch_planner_environments(["host"], registry={}, mesh={"serviceMap": {}})
+
+    assert envs[0]["inventory"]["domains"]["env:monitors.id"][0]["value"] == 2
+
+
 def test_fetch_planner_environments_adds_windows_for_window_anchor_prompt(monkeypatch):
     calls = []
 

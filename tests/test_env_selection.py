@@ -80,6 +80,27 @@ def test_remembered_value_is_fingerprint_keyed():
     assert res["decisions"][0]["source"] == "remembered"
 
 
+def test_primary_monitor_prompt_selects_primary_inventory_option():
+    res = resolve_env_enums(_flow(), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1", "primary": False},
+        {"value": 2, "label": "DP-2", "primary": True},
+    ]), prompt="zrob zrzut ekranu monitora głównego")
+
+    assert res["ok"] is True
+    assert res["flow"]["steps"][0]["payload"]["monitor"] == 2
+    assert res["decisions"][0]["source"] == "primary"
+
+
+def test_primary_monitor_prompt_still_asks_when_inventory_has_no_primary():
+    res = resolve_env_enums(_flow(), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]), prompt="zrob zrzut ekranu monitora glownego")
+
+    assert res["ok"] is False
+    assert res["kind"] == "needs-selection"
+
+
 def test_result_reference_defers_env_enum_until_execution():
     res = resolve_env_enums(
         _flow({"monitor_from": "list_windows.result.value.selected.monitor"}),
