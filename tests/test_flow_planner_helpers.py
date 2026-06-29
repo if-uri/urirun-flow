@@ -606,6 +606,56 @@ def test_thin_plan_injects_inventory_beside_drift_for_kvm_steps():
     assert plan[1]["uri"] == "twin://host/env/query/inventory"
 
 
+def test_fetch_planner_environments_prefers_twin_profile_inventory(monkeypatch):
+    calls = []
+
+    def fake_local(uri, payload=None):
+        calls.append(("local", uri, dict(payload or {})))
+        if uri == "twin://host/environment/query/profile":
+            return {"ok": True, "result": {"value": {
+                "ok": True,
+                "node": "host",
+                "profile": {
+                    "controlStrategies": {"cdp": True},
+                    "best": "cdp",
+                    "controllable": True,
+                    "actionMatrix": {},
+                },
+                "surface": {"kind": "browser", "browser": {
+                    "url": "https://linkedin.com/feed",
+                    "title": "Feed",
+                }},
+                "constraints": [{"kind": "infeasible", "what": "web-auth", "surface": "cdp"}],
+                "warnings": ["measured by twin"],
+            }}}
+        if uri == "twin://host/environment/query/inventory":
+            return {"ok": True, "result": {"value": {
+                "ok": True,
+                "node": "host",
+                "displays": [{"id": "DP-2", "primary": True}],
+                "audioSinks": [],
+                "cameras": [],
+            }}}
+        return None
+
+    def fake_v2_call(uri, payload, registry, mode):
+        calls.append(("v2", uri, dict(payload or {})))
+        return {"ok": False, "result": {"value": {}}}
+
+    monkeypatch.setattr(planner, "_local_inprocess_query", fake_local)
+    monkeypatch.setattr(planner.v2_service, "call", fake_v2_call)
+
+    envs = planner.fetch_planner_environments(["host"], registry={}, mesh={"serviceMap": {}})
+
+    assert len(envs) == 1
+    assert envs[0]["facts"]["bestSurface"] == "cdp"
+    assert envs[0]["facts"]["foreground"]["url"] == "https://linkedin.com/feed"
+    assert envs[0]["inventory"]["displays"][0]["id"] == "DP-2"
+    assert any(c.get("what") == "web-auth" for c in envs[0]["constraints"])
+    assert any("measured by twin" in g for g in envs[0]["guidance"])
+    assert not any(uri.startswith("kvm://") for _, uri, _ in calls)
+
+
 def test_env_inventory_builds_monitor_domain_from_display(monkeypatch):
     def fake_call(uri, payload, registry):
         if uri.endswith("/display/query/info"):

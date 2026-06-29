@@ -8,7 +8,7 @@ concrete payload or a typed ``needs-selection`` request.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Callable
 
 
 def _target(uri: str) -> str:
@@ -35,6 +35,44 @@ def _inventory_for(node: str, inventories: dict[str, dict] | list[dict] | None) 
         if isinstance(inv, dict) and str(inv.get("node") or "host") == node:
             return inv
     return {}
+
+
+def flow_route_domains(flow: dict, routes: list[dict]) -> dict[str, dict]:
+    """Return route-declared env domains used by this flow, keyed by URI."""
+    by_uri = {str(r.get("uri") or ""): r for r in routes or []}
+    out: dict[str, dict] = {}
+    for step in flow.get("steps") or []:
+        uri = str(step.get("uri") or "")
+        contract = (by_uri.get(uri, {}).get("meta") or {}).get("contract") or {}
+        domains = contract.get("domains") or {}
+        if domains:
+            out[uri] = domains
+    return out
+
+
+def env_enum_nodes(flow: dict, routes: list[dict]) -> list[str]:
+    """Return target nodes whose steps need contract-declared env enum inventory."""
+    domains = flow_route_domains(flow, routes)
+    if not domains:
+        return []
+    nodes = {
+        _target(str(step.get("uri") or ""))
+        for step in flow.get("steps") or []
+        if str(step.get("uri") or "") in domains
+    }
+    return sorted(nodes)
+
+
+def build_env_enum_inventories(
+    flow: dict,
+    routes: list[dict],
+    *,
+    inventory_builder: Callable[[str], dict] | None = None,
+) -> dict[str, dict]:
+    """Build live inventory only for nodes whose flow steps declare env enum domains."""
+    if inventory_builder is None:
+        return {}
+    return {node: inventory_builder(node) for node in env_enum_nodes(flow, routes)}
 
 
 def _domain_options(inventory: dict, domain: str) -> list[dict]:
@@ -223,3 +261,23 @@ def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dic
             decisions.append({"uri": uri, "parameter": param, "source": "unresolved"})
         out_steps.append({**step, "payload": payload})
     return {"ok": True, "flow": {**flow, "steps": out_steps}, "decisions": decisions}
+
+
+def resolve_flow_env_enums(
+    flow: dict,
+    routes: list[dict],
+    *,
+    memory: Any = None,
+    inventories: dict[str, dict] | list[dict] | None = None,
+    inventory_builder: Callable[[str], dict] | None = None,
+) -> dict:
+    """Resolve env enum slots for a whole flow and attach the inventory used."""
+    if not flow_route_domains(flow, routes):
+        return {"ok": True, "flow": flow, "inventories": {}}
+    resolved_inventories = (
+        inventories
+        if inventories is not None
+        else build_env_enum_inventories(flow, routes, inventory_builder=inventory_builder)
+    )
+    result = resolve_env_enums(flow, routes, resolved_inventories or {}, memory=memory)
+    return {**result, "inventories": resolved_inventories or {}}

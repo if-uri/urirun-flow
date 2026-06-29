@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from urirun_flow.env_selection import recall_env_enum_replan_required, resolve_env_enums
+from urirun_flow.env_selection import (
+    build_env_enum_inventories,
+    flow_route_domains,
+    recall_env_enum_replan_required,
+    resolve_env_enums,
+    resolve_flow_env_enums,
+)
 
 
 ROUTE = "kvm://host/screen/query/capture"
@@ -200,3 +206,62 @@ def test_new_env_enum_device_needs_declaration_not_resolver_code():
     assert res["kind"] == "needs-selection"
     assert [opt["value"] for opt in res["needsSelection"]["options"]] == ["hp", "epson"]
     assert resolve_env_enums.__code__.co_code == before
+
+
+def test_flow_route_domains_reads_contract_domains_from_routes():
+    flow = {"steps": [
+        {"id": "cap", "uri": ROUTE, "payload": {}},
+        {"id": "noop", "uri": "kvm://host/input/command/wait", "payload": {}},
+    ]}
+
+    assert flow_route_domains(flow, ROUTES) == {
+        ROUTE: ROUTES[0]["meta"]["contract"]["domains"],
+    }
+
+
+def test_build_env_enum_inventories_only_for_domain_steps():
+    calls = []
+    routes = [
+        *ROUTES,
+        {"uri": "audio://desk/sink/command/route",
+         "meta": {"contract": {"domains": {"sink": {
+             "type": "enum", "domain": "env:audio_sinks.id"}}}}},
+        {"uri": "kvm://ignored/input/command/wait", "meta": {"contract": {}}},
+    ]
+    flow = {"steps": [
+        {"id": "cap", "uri": ROUTE, "payload": {}},
+        {"id": "sink", "uri": "audio://desk/sink/command/route", "payload": {}},
+        {"id": "wait", "uri": "kvm://ignored/input/command/wait", "payload": {}},
+    ]}
+
+    inventories = build_env_enum_inventories(
+        flow,
+        routes,
+        inventory_builder=lambda node: calls.append(node) or {"node": node, "domains": {}},
+    )
+
+    assert calls == ["desk", "host"]
+    assert sorted(inventories) == ["desk", "host"]
+
+
+def test_resolve_flow_env_enums_is_flow_level_single_entrypoint():
+    calls = []
+    route = {"uri": "print://host/doc/command/print",
+             "meta": {"contract": {"domains": {"printer": {
+                 "type": "enum", "domain": "env:printers.id"}}}}}
+    flow = {"steps": [{"id": "print", "uri": "print://host/doc/command/print", "payload": {}}]}
+
+    res = resolve_flow_env_enums(
+        flow,
+        [route],
+        inventory_builder=lambda node: calls.append(node) or {
+            "node": node,
+            "fingerprint": "env-print",
+            "domains": {"env:printers.id": [{"value": "hp"}]},
+        },
+    )
+
+    assert res["ok"] is True
+    assert calls == ["host"]
+    assert res["inventories"]["host"]["fingerprint"] == "env-print"
+    assert res["flow"]["steps"][0]["payload"]["printer"] == "hp"

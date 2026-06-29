@@ -77,6 +77,29 @@ def _llm_model_actions() -> list[dict]:
     }]
 
 
+def _llm_provider_quota_actions() -> list[dict]:
+    return [
+        {
+            "id": "switch-llm-model-or-key",
+            "kind": "auth",
+            "automatic": False,
+            "label": "Switch to a model/key with quota (URIRUN_LLM_MODEL/LLM_MODEL and provider API key).",
+        },
+        {
+            "id": "retry-no-llm",
+            "kind": "retry",
+            "automatic": False,
+            "label": "Retry with noLlm=true when the deterministic planner can cover this intent.",
+        },
+        {
+            "id": "use-retrieved-known-good",
+            "kind": "planner",
+            "automatic": False,
+            "label": "If a verified known-good episode exists for this intent/environment, recall it and revalidate.",
+        },
+    ]
+
+
 def _transient_actions(target: str) -> list[dict]:
     actions: list[dict] = []
     if target:
@@ -222,6 +245,26 @@ def _is_llm_model_error(message: str) -> bool:
     return "urirun_llm_model" in message or "llm_model" in message
 
 
+def _is_llm_provider_quota_error(message: str) -> bool:
+    return any(signal in message for signal in (
+        "openrouter",
+        "litellm",
+        "key limit exceeded",
+        "insufficient credit",
+        "quota",
+        "rate limit",
+        "resource exhausted",
+        "too many requests",
+    )) and any(signal in message for signal in (
+        "key limit exceeded",
+        "insufficient credit",
+        "quota",
+        "rate limit",
+        "resource exhausted",
+        "too many requests",
+    ))
+
+
 def _is_cdp_deadline(category: str, uri: str) -> bool:
     return category == "DEADLINE_EXCEEDED" and _is_cdp_page_level_query(uri)
 
@@ -231,6 +274,8 @@ def _uri_scheme(uri: str) -> str:
 
 
 def _dispatch_recovery(category: str, message: str, uri: str, step: dict, routes: list, error: dict) -> list[dict]:
+    if _is_llm_provider_quota_error(message):
+        return _llm_provider_quota_actions()
     if _is_llm_model_error(message):
         return _llm_model_actions()
     if category in {"UNAVAILABLE", "DEADLINE_EXCEEDED"}:

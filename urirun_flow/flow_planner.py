@@ -1637,6 +1637,82 @@ def _kvm_query_uri_for_node(registry: dict, node: str, route: str) -> str | None
     return None
 
 
+def _twin_host_query(node: str, registry: dict, route: str) -> dict | None:
+    """Fetch a planner environment fact through the Digital Twin boundary.
+
+    The planner should consume facts about the environment (profile/inventory), not the
+    implementation detail that currently happens to measure those facts. The twin route may still
+    call KVM internally, but that dependency is then owned by the twin connector, not by the
+    NL→flow planner. ``None`` keeps the historical KVM fallback alive for older installs.
+    """
+    payload = {"node": node} if node else {}
+    uri = f"twin://host/{route}"
+    if str(node or "").casefold() in ("", "host", "localhost", "local", "127.0.0.1"):
+        local = _local_inprocess_query(uri, payload)
+        value = result_data(local) if isinstance(local, dict) and local.get("ok") else None
+        if isinstance(value, dict) and value.get("ok", True) is not False:
+            return value
+    try:
+        env = v2_service.call(uri, payload, registry, mode="execute")
+        value = result_data(env)
+        if isinstance(value, dict) and value.get("ok", True) is not False:
+            return value
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _profile_from_twin_environment(profile: dict) -> tuple[dict, dict | None]:
+    """Adapt ``twin://host/environment/query/profile`` into planner_context inputs."""
+    inner = dict(profile.get("profile") or {})
+    surface = profile.get("surface") if isinstance(profile.get("surface"), dict) else None
+    if profile.get("bestSurface") is not None and not inner.get("best"):
+        inner["best"] = profile.get("bestSurface")
+    for key in ("controllable", "actionMatrix", "osLevelReliable", "display"):
+        if profile.get(key) is not None and inner.get(key) is None:
+            inner[key] = profile.get(key)
+    if profile.get("constraints"):
+        inner["_twinConstraints"] = list(profile.get("constraints") or [])
+    if profile.get("warnings"):
+        inner["_twinWarnings"] = list(profile.get("warnings") or [])
+    if profile.get("sessionProbe"):
+        inner["_twinSessionProbe"] = profile.get("sessionProbe")
+    if profile.get("sessionSelection"):
+        inner["_twinSessionSelection"] = profile.get("sessionSelection")
+    return inner, surface
+
+
+def _is_twin_environment_profile(value: dict | None) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return any(key in value for key in (
+        "profile", "surface", "actionMatrix", "constraints", "bestSurface",
+        "controllable", "host", "sessionProbe", "sessionSelection", "warnings",
+    ))
+
+
+def _planner_context_from_twin(node: str, twin_profile: dict, twin_inventory: dict | None,
+                               *, memory: "TwinMemory | None" = None) -> dict:
+    from urirun.node.reversible import planner_context
+    profile, surface = _profile_from_twin_environment(twin_profile)
+    ctx = planner_context(node, profile, surface, memory=memory)
+    twin_constraints = profile.get("_twinConstraints") or []
+    if twin_constraints:
+        existing = list(ctx.get("constraints") or [])
+        ctx["constraints"] = [*existing, *[c for c in twin_constraints if isinstance(c, dict)]]
+    if twin_inventory:
+        ctx["inventory"] = twin_inventory
+    if profile.get("_twinWarnings"):
+        ctx.setdefault("guidance", []).extend(
+            f"Twin warning: {warning}" for warning in profile.get("_twinWarnings") or []
+        )
+    if profile.get("_twinSessionSelection"):
+        ctx["sessionSelection"] = profile.get("_twinSessionSelection")
+    if profile.get("_twinSessionProbe"):
+        ctx["sessionProbe"] = profile.get("_twinSessionProbe")
+    return ctx
+
+
 def _fetch_env_profile(step: dict, registry: dict) -> dict | None:
     return _fetch_kvm_query(step, registry, "env/query/profile", "controlStrategies")
 
@@ -1661,6 +1737,11 @@ def fetch_planner_environments(node_names: list[str], registry: dict, mesh: dict
     out: list[dict] = []
     try:
         for name in node_names or []:
+            twin_profile = _twin_host_query(name, registry, "environment/query/profile")
+            if _is_twin_environment_profile(twin_profile):
+                twin_inventory = _twin_host_query(name, registry, "environment/query/inventory")
+                out.append(_planner_context_from_twin(name, twin_profile, twin_inventory, memory=memory))
+                continue
             prof = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "env/query/profile", "controlStrategies")
             if not prof:
                 continue
