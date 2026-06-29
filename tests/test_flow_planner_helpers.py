@@ -4,6 +4,8 @@ template matching, JSON extraction). These live with the flow package — they n
 helper coverage (the hub keeps the integration tests that exercise execution through the shim)."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from urirun_flow import flow_planner as planner
@@ -640,6 +642,58 @@ def test_make_flow_llm_model_override_is_passed_to_provider(monkeypatch):
     assert captured["model"] == "request/model"
     assert generator["model"] == "request/model"
     assert flow["steps"][0]["uri"] == "kvm://host/screen/query/capture"
+
+
+def test_llm_prompt_filters_routes_and_slenders_contracts_for_screen(monkeypatch):
+    routes = [
+        {"uri": f"adb://host/noise{i}/query/list", "node": "host", "safe": True,
+         "inputSchema": {"type": "object"}}
+        for i in range(30)
+    ]
+    routes.extend([
+        {"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True,
+         "inputSchema": {"type": "object"},
+         "meta": {"contract": {
+             "effect": "query",
+             "domains": {"monitor": {"type": "enum", "domain": "env:monitors.id"}},
+             "examples": [{"result": {"path": "/huge/example.png"}}],
+         }}},
+        {"uri": "kvm://host/window/query/list", "node": "host", "safe": True,
+         "inputSchema": {"type": "object"}},
+    ])
+    mesh = {"nodes": [{"name": "host", "reachable": True}], "routes": routes}
+    captured = {}
+
+    class _Message:
+        content = (
+            '{"task":{"id":"shot"},"steps":[{"id":"cap",'
+            '"uri":"kvm://host/screen/query/capture","payload":{},"depends_on":[]}]}'
+        )
+
+    class _Choice:
+        message = _Message()
+
+    class _Response:
+        choices = [_Choice()]
+
+    def fake_completion(*, model, messages, **kwargs):
+        captured["request"] = json.loads(messages[1]["content"])
+        return _Response()
+
+    monkeypatch.setattr(planner, "quiet_completion", fake_completion)
+
+    make_flow("zrob zrzut ekranu", mesh, use_llm=True, llm_model="request/model")
+
+    allowed = captured["request"]["allowedRoutes"]
+    uris = {route["uri"] for route in allowed}
+    assert "kvm://host/screen/query/capture" in uris
+    assert "kvm://host/window/query/list" in uris
+    assert not any(uri.startswith("adb://") for uri in uris)
+    capture = next(route for route in allowed if route["uri"] == "kvm://host/screen/query/capture")
+    assert capture["contract"] == {
+        "effect": "query",
+        "domains": {"monitor": {"type": "enum", "domain": "env:monitors.id"}},
+    }
 
 
 def test_thin_plan_injects_inventory_beside_drift_for_kvm_steps():

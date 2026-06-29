@@ -1475,6 +1475,46 @@ def _empty_flow_hint(safe_route_count: int, planner_reason: str = "") -> str:
 
 # ── LLM flow generation ───────────────────────────────────────────────────────
 
+def _llm_contract_view(contract: dict) -> dict:
+    """Small contract slice for PROPOSE-stage prompts.
+
+    Full contracts carry examples and rich output schemas that are useful to gates and docs but
+    expensive in LLM context. The planner needs only the invariants that constrain choices; the
+    full contract is still used later by router/runtime admission.
+    """
+    if not isinstance(contract, dict):
+        return {}
+    return {
+        key: contract[key]
+        for key in ("effect", "reversible", "domains")
+        if key in contract
+    }
+
+
+def _llm_route_relevant(prompt: str, route: dict) -> bool:
+    uri = str(route.get("uri") or "")
+    low = nl_key(prompt)
+    intents = _flow_intents_lexical(prompt)
+    browserish = bool(first_url(prompt) or re.search(r"\b(chrome|browser|przegl\w+|linkedin|github|google|stron\w+|page|url)\b", low))
+    artifactish = bool(re.search(r"\b(artifact|artefakt|zapisz|dolacz|dołącz|attachment)\b", low))
+    if intents.get("screen"):
+        keep = ("/screen/", "/window/", "/display/", "/surface/", "/env/")
+        if browserish:
+            keep = (*keep, "/cdp/", "/browser/", "/ui/", "/input/")
+        if artifactish:
+            keep = (*keep, "artifact://")
+        return any(part in uri for part in keep)
+    if browserish:
+        return any(part in uri for part in ("/cdp/", "/browser/", "/window/", "/screen/", "/ui/", "/input/", "/env/", "/surface/"))
+    if intents.get("health"):
+        return any(part in uri for part in ("/runtime/query/health", "/env/", "/status", "/query/info"))
+    if intents.get("files") or intents.get("invoices"):
+        return any(part in uri for part in ("fs://", "invoice://", "artifact://", "/dir/query/", "/folder/query/"))
+    if intents.get("processes") or intents.get("logs"):
+        return any(part in uri for part in ("proc://", "log://", "shell://", "/runtime/query/health"))
+    return True
+
+
 def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
              environments: list[dict] | None = None,
              retrieval: dict | None = None,
@@ -1490,10 +1530,12 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
             "kind": route.get("kind"),
             "title": route.get("title"),
             "inputSchema": route.get("inputSchema") or {"type": "object"},
-            "contract": (route.get("meta") or {}).get("contract") or route.get("contract") or {},
+            "contract": _llm_contract_view(
+                (route.get("meta") or {}).get("contract") or route.get("contract") or {}
+            ),
         }
         for route in routes
-        if safe_route(route)
+        if safe_route(route) and _llm_route_relevant(prompt, route)
     ]
     messages = [
         {
