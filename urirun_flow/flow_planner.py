@@ -1495,7 +1495,10 @@ def _llm_route_relevant(prompt: str, route: dict) -> bool:
     uri = str(route.get("uri") or "")
     low = nl_key(prompt)
     intents = _flow_intents_lexical(prompt)
-    browserish = bool(first_url(prompt) or re.search(r"\b(chrome|browser|przegl\w+|linkedin|github|google|stron\w+|page|url)\b", low))
+    browserish = bool(first_url(prompt) or re.search(
+        r"\b(chrome|browser|przegl\w+|linkedin|github|google|stron\w+|page|url|cdp|debug|debugg\w+|sesj\w+|gotow\w+)\b",
+        low,
+    ))
     artifactish = bool(re.search(r"\b(artifact|artefakt|zapisz|dolacz|dołącz|attachment)\b", low))
     if intents.get("screen"):
         keep = ("/screen/", "/window/", "/display/", "/surface/", "/env/")
@@ -1560,6 +1563,10 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
                 "never re-call ensure, it would spawn a competing Chrome over the profile lock). "
                 "Only then run any 'cdp/page/*' step (it opens a WS to that port). Never emit "
                 "'cdp/session/command/launch' — it does not exist; use 'ensure'. "
+                "CDP READINESS REQUESTS: when the user asks whether a CDP session/debug port is ready, "
+                "emit 'cdp/session/query/ready'. When they ask to launch/start Chrome with a debug port, "
+                "emit 'cdp/session/command/ensure' followed by 'cdp/session/query/ready'. If they also ask "
+                "whether the page is ready, add 'cdp/page/query/ready' after session readiness. "
                 # Route-selection preference: DOM-level (CDP) beats pixel-level (OCR) for web content.
                 "ROUTE PREFERENCE — when the target is web content in a browser and the allowedRoutes "
                 "expose CDP page commands (uris containing 'cdp/page/command/click' or "
@@ -1959,6 +1966,7 @@ def make_flow(prompt: str, mesh: dict, selected_nodes: list[str] | None = None, 
                 selected_nodes=selected_nodes,
                 environments=environments,
             )
+            flow = _inject_capture_if_needed(flow, prompt, allowed)
             return flow, {"provider": "litellm", "fallback": False,
                           **({"model": resolved_model} if resolved_model else {})}
         except Exception as exc:  # noqa: BLE001 - LLM leads; the heuristic is the explicit fallback.

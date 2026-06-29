@@ -644,6 +644,51 @@ def test_make_flow_llm_model_override_is_passed_to_provider(monkeypatch):
     assert flow["steps"][0]["uri"] == "kvm://host/screen/query/capture"
 
 
+def test_make_flow_llm_success_marks_cdp_screenshot_as_browser_scope(monkeypatch):
+    mesh = {
+        "nodes": [{"name": "host", "reachable": True}],
+        "routes": [
+            {"uri": "kvm://host/cdp/session/command/ensure", "node": "host", "safe": True},
+            {"uri": "kvm://host/cdp/session/query/ready", "node": "host", "safe": True},
+            {"uri": "kvm://host/cdp/page/command/navigate", "node": "host", "safe": True},
+            {"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True},
+        ],
+    }
+
+    class _Message:
+        content = json.dumps({
+            "task": {"id": "web-shot"},
+            "steps": [
+                {"id": "ensure", "uri": "kvm://host/cdp/session/command/ensure",
+                 "payload": {"url": "https://example.com"}, "depends_on": []},
+                {"id": "nav", "uri": "kvm://host/cdp/page/command/navigate",
+                 "payload": {"url": "https://example.com"}, "depends_on": ["ensure"]},
+                {"id": "cap", "uri": "kvm://host/screen/query/capture",
+                 "payload": {}, "depends_on": ["nav"]},
+            ],
+        })
+
+    class _Choice:
+        message = _Message()
+
+    class _Response:
+        choices = [_Choice()]
+
+    monkeypatch.setattr(planner, "quiet_completion", lambda **_: _Response())
+
+    flow, generator = make_flow(
+        "otworz https://example.com i zrob zrzut ekranu",
+        mesh,
+        use_llm=True,
+        llm_model="request/model",
+    )
+
+    assert generator["fallback"] is False
+    capture = flow["steps"][-1]
+    assert capture["uri"] == "kvm://host/screen/query/capture"
+    assert capture["payload"]["scope"] == "browser"
+
+
 def test_llm_prompt_filters_routes_and_slenders_contracts_for_screen(monkeypatch):
     routes = [
         {"uri": f"adb://host/noise{i}/query/list", "node": "host", "safe": True,
@@ -694,6 +739,49 @@ def test_llm_prompt_filters_routes_and_slenders_contracts_for_screen(monkeypatch
         "effect": "query",
         "domains": {"monitor": {"type": "enum", "domain": "env:monitors.id"}},
     }
+
+
+def test_llm_prompt_filters_routes_for_cdp_readiness(monkeypatch):
+    routes = [
+        {"uri": f"adb://host/noise{i}/query/list", "node": "host", "safe": True,
+         "inputSchema": {"type": "object"}}
+        for i in range(20)
+    ]
+    routes.extend([
+        {"uri": "kvm://host/cdp/session/query/ready", "node": "host", "safe": True,
+         "inputSchema": {"type": "object"}},
+        {"uri": "kvm://host/cdp/session/command/ensure", "node": "host", "safe": True,
+         "inputSchema": {"type": "object"}},
+        {"uri": "kvm://host/cdp/page/query/ready", "node": "host", "safe": True,
+         "inputSchema": {"type": "object"}},
+    ])
+    mesh = {"nodes": [{"name": "host", "reachable": True}], "routes": routes}
+    captured = {}
+
+    class _Message:
+        content = (
+            '{"task":{"id":"cdp"},"steps":[{"id":"ready",'
+            '"uri":"kvm://host/cdp/session/query/ready","payload":{},"depends_on":[]}]}'
+        )
+
+    class _Choice:
+        message = _Message()
+
+    class _Response:
+        choices = [_Choice()]
+
+    def fake_completion(*, messages, **kwargs):
+        captured["request"] = json.loads(messages[1]["content"])
+        return _Response()
+
+    monkeypatch.setattr(planner, "quiet_completion", fake_completion)
+
+    make_flow("sprawdz czy sesja CDP jest gotowa", mesh, use_llm=True, llm_model="request/model")
+
+    uris = {route["uri"] for route in captured["request"]["allowedRoutes"]}
+    assert "kvm://host/cdp/session/query/ready" in uris
+    assert "kvm://host/cdp/session/command/ensure" in uris
+    assert not any(uri.startswith("adb://") for uri in uris)
 
 
 def test_thin_plan_injects_inventory_beside_drift_for_kvm_steps():

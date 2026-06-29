@@ -18,7 +18,7 @@ ROUTES = [{
         "optional": True,
         "emptyValues": [0, ""],
         "preference": "screen.capture.default",
-        "skipWhen": {"scope": ["all", "all-monitors", "desktop"]},
+        "skipWhen": {"scope": ["all", "all-monitors", "desktop", "browser", "browser-page"]},
     }}}},
 }]
 
@@ -135,6 +135,17 @@ def test_skip_when_scope_all_does_not_ask_for_monitor():
 
     assert res["ok"] is True
     assert res["flow"]["steps"][0]["payload"] == {"scope": "all", "monitor": -1}
+    assert res["decisions"][0]["source"] == "skip"
+
+
+def test_skip_when_scope_browser_does_not_ask_for_monitor():
+    res = resolve_env_enums(_flow({"scope": "browser"}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]))
+
+    assert res["ok"] is True
+    assert res["flow"]["steps"][0]["payload"] == {"scope": "browser"}
     assert res["decisions"][0]["source"] == "skip"
 
 
