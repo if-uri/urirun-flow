@@ -164,7 +164,9 @@ def _flow_intents(prompt: str, *, use_llm: bool = True) -> dict[str, bool]:
 # ── Heuristic flow building ───────────────────────────────────────────────────
 
 def _append_target_steps(steps: list[dict], route_uris: set, target: str, intents: dict[str, bool],
-                         url: str, previous, *, prompt: str = "", window_anchor: dict | None = None):
+                         url: str, previous, *, prompt: str = "",
+                         environments: list[dict] | None = None,
+                         window_anchor: dict | None = None):
     """Append the available steps for one target node, returning the new previous-step id."""
     health_added = False
 
@@ -196,7 +198,7 @@ def _append_target_steps(steps: list[dict], route_uris: set, target: str, intent
         )
     if intents["screen"]:
         previous = ensure_health(previous)
-        capture_payload = _screenshot_capture_payload(prompt)
+        capture_payload = _screenshot_capture_payload(prompt, environments=environments, target=target)
         window_uri = f"kvm://{target}/window/query/list"
         capture_uri = f"kvm://{target}/screen/query/capture"
         if window_anchor and window_uri in route_uris and capture_uri in route_uris:
@@ -366,6 +368,7 @@ def heuristic_flow(prompt: str, routes: list[dict], nodes: list[dict], selected_
             path if (intents["files"] or intents["invoices"]) else url,
             previous,
             prompt=prompt,
+            environments=environments,
             window_anchor=_window_anchor_from_environment(prompt, environments, target),
         )
 
@@ -914,7 +917,39 @@ _MONITOR_ORDINALS = {
 }
 
 
-def _screenshot_capture_payload(prompt: str) -> dict:
+def _primary_monitor_id_from_environment(
+    environments: list[dict] | None,
+    target: str | None,
+) -> int | None:
+    for env in environments or []:
+        if target and str(env.get("node") or target) != target:
+            continue
+        inventory = env.get("inventory") if isinstance(env.get("inventory"), dict) else {}
+        domains: dict = {}
+        for source in (env.get("domains"), inventory.get("domains")):
+            if isinstance(source, dict):
+                domains.update(source)
+        for opt in domains.get("env:monitors.id", []) or []:
+            if not isinstance(opt, dict) or not opt.get("primary"):
+                continue
+            value = opt.get("value", opt.get("id", opt.get("index")))
+            if isinstance(value, int) and value > 0:
+                return value
+        for mon in (env.get("monitors") or inventory.get("monitors") or []):
+            if not isinstance(mon, dict) or not mon.get("primary"):
+                continue
+            value = mon.get("value", mon.get("id", mon.get("index")))
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
+def _screenshot_capture_payload(
+    prompt: str,
+    *,
+    environments: list[dict] | None = None,
+    target: str | None = None,
+) -> dict:
     """Derive capture-surface preferences from NL.
 
     KVM keeps ``monitor=0`` as its legacy default. Explicit user monitor
@@ -954,6 +989,10 @@ def _screenshot_capture_payload(prompt: str) -> dict:
     for word, number in _MONITOR_ORDINALS.items():
         if re.search(rf"\b{re.escape(word)}\s+monitor\b|\bmonitor\s+{re.escape(word)}\b", low):
             return {"monitor": number}
+    if re.search(r"\b(primary|main|glown\w*)\b", low):
+        primary = _primary_monitor_id_from_environment(environments, target)
+        if primary is not None:
+            return {"monitor": primary}
     return {}
 
 
@@ -1659,6 +1698,17 @@ def _fetch_kvm_query(step: dict, registry: dict, route: str, marker: str) -> dic
     return None
 
 
+def _kvm_inventory_for_planner(node: str, registry: dict) -> dict | None:
+    try:
+        from urirun_flow.flow import _build_env_inventory  # noqa: PLC0415
+        inventory = _build_env_inventory(node, registry)
+    except Exception:  # noqa: BLE001 - inventory is advisory planner context
+        return None
+    if isinstance(inventory, dict) and (inventory.get("domains") or inventory.get("monitors")):
+        return inventory
+    return None
+
+
 def _kvm_query_uri_for_node(registry: dict, node: str, route: str) -> str | None:
     """Return the advertised KVM query URI for a host-config node name.
 
@@ -1780,7 +1830,10 @@ def fetch_planner_environments(node_names: list[str], registry: dict, mesh: dict
         for name in node_names or []:
             twin_profile = _twin_host_query(name, registry, "environment/query/profile")
             if _is_twin_environment_profile(twin_profile):
-                twin_inventory = _twin_host_query(name, registry, "environment/query/inventory")
+                twin_inventory = (
+                    _twin_host_query(name, registry, "environment/query/inventory")
+                    or _twin_host_query(name, registry, "env/query/inventory")
+                )
                 ctx = _planner_context_from_twin(name, twin_profile, twin_inventory, memory=memory)
                 if _prompt_needs_window_inventory(prompt):
                     win = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "window/query/list", "windows")
@@ -1793,6 +1846,9 @@ def fetch_planner_environments(node_names: list[str], registry: dict, mesh: dict
                 continue
             surf = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "surface/query/current", "kind")
             ctx = planner_context(name, prof, surf, memory=memory)
+            inventory = _kvm_inventory_for_planner(name, registry)
+            if inventory:
+                ctx["inventory"] = inventory
             win = _fetch_kvm_query({"uri": f"kvm://{name}/x"}, registry, "window/query/list", "windows")
             if isinstance(win, dict):
                 ctx["windows"] = [w for w in (win.get("windows") or []) if isinstance(w, dict)]

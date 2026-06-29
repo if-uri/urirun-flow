@@ -701,6 +701,34 @@ def test_fetch_planner_environments_prefers_twin_profile_inventory(monkeypatch):
     assert not any(uri.startswith("kvm://") for _, uri, _ in calls)
 
 
+def test_fetch_planner_environments_accepts_env_inventory_alias(monkeypatch):
+    calls = []
+
+    def fake_local(uri, payload=None):
+        calls.append(uri)
+        if uri == "twin://host/environment/query/profile":
+            return {"ok": True, "result": {"value": {
+                "ok": True,
+                "node": "host",
+                "profile": {"controlStrategies": {"atspi": True}, "best": "atspi"},
+            }}}
+        if uri == "twin://host/env/query/inventory":
+            return {"ok": True, "result": {"value": {
+                "ok": True,
+                "node": "host",
+                "domains": {"env:monitors.id": [{"value": 1, "primary": True}]},
+            }}}
+        return None
+
+    monkeypatch.setattr(planner, "_local_inprocess_query", fake_local)
+
+    envs = planner.fetch_planner_environments(["host"], registry={}, mesh={"serviceMap": {}})
+
+    assert "twin://host/environment/query/inventory" in calls
+    assert "twin://host/env/query/inventory" in calls
+    assert envs[0]["inventory"]["domains"]["env:monitors.id"][0]["value"] == 1
+
+
 def test_fetch_planner_environments_adds_windows_for_window_anchor_prompt(monkeypatch):
     calls = []
 
@@ -973,6 +1001,34 @@ def test_heuristic_uses_window_inventory_for_named_monitor_anchor():
         "monitor_from": "kvm_host_window_query_list.result.value.selected.monitor"
     }
     assert flow["steps"][1]["depends_on"] == ["kvm_host_window_query_list"]
+
+
+def test_heuristic_uses_primary_monitor_from_inventory():
+    routes = [
+        {"uri": "kvm://host/screen/query/capture", "node": "host", "safe": True},
+    ]
+    environments = [{
+        "node": "host",
+        "inventory": {
+            "domains": {
+                "env:monitors.id": [
+                    {"value": 1, "label": "HDMI-1", "primary": False},
+                    {"value": 2, "label": "DP-2", "primary": True},
+                ],
+            },
+        },
+    }]
+
+    flow = heuristic_flow(
+        "zrob zrzut ekranu monitora glownego",
+        routes,
+        [{"name": "host"}],
+        selected_nodes=["host"],
+        use_llm=False,
+        environments=environments,
+    )
+
+    assert flow["steps"][0]["payload"] == {"monitor": 2}
 
 
 def test_heuristic_does_not_invent_window_anchor_when_inventory_has_no_match():
