@@ -1635,7 +1635,32 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
         },
     ]
     response = quiet_completion(model=model, messages=messages, temperature=0, response_format={"type": "json_object"})
-    return json_from_text(response.choices[0].message.content)
+    content = response.choices[0].message.content or "{}"
+    flow = json_from_text(content)
+    if allowed_routes and not (isinstance(flow.get("steps"), list) and flow.get("steps")):
+        repair_messages = [
+            *messages,
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": (
+                "Your JSON plan had an empty 'steps' array. That is invalid when allowedRoutes are available. "
+                "Return strict JSON again with at least one atomic step using only allowedRoutes. "
+                "For readiness/status requests, a matching query/ready or status query step is enough. "
+                "For launch/open requests, include the launch/open command and then a readiness/status query. "
+                "For browser/CDP tasks, use this available URI pattern when present: "
+                "cdp/session/command/ensure -> cdp/session/query/ready -> "
+                "cdp/page/command/navigate -> cdp/page/query/ready -> ui/query/verify; "
+                "include only the steps required by the request. "
+                "Do not return empty steps."
+            )},
+        ]
+        response = quiet_completion(
+            model=model,
+            messages=repair_messages,
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        flow = json_from_text(response.choices[0].message.content or "{}")
+    return flow
 
 
 # ── Session helpers ───────────────────────────────────────────────────────────

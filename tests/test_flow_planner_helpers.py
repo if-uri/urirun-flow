@@ -784,6 +784,42 @@ def test_llm_prompt_filters_routes_for_cdp_readiness(monkeypatch):
     assert not any(uri.startswith("adb://") for uri in uris)
 
 
+def test_llm_empty_steps_are_repaired_with_second_proposal(monkeypatch):
+    mesh = {
+        "nodes": [{"name": "host", "reachable": True}],
+        "routes": [
+            {"uri": "kvm://host/cdp/session/query/ready", "node": "host", "safe": True,
+             "inputSchema": {"type": "object"}},
+        ],
+    }
+    calls = []
+
+    class _Choice:
+        def __init__(self, content: str):
+            self.message = type("Msg", (), {"content": content})()
+
+    class _Response:
+        def __init__(self, content: str):
+            self.choices = [_Choice(content)]
+
+    def fake_completion(*, messages, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            return _Response('{"task":{"id":"empty"},"steps":[]}')
+        return _Response(
+            '{"task":{"id":"ready"},"steps":[{"id":"ready",'
+            '"uri":"kvm://host/cdp/session/query/ready","payload":{},"depends_on":[]}]}'
+        )
+
+    monkeypatch.setattr(planner, "quiet_completion", fake_completion)
+
+    flow, generator = make_flow("sprawdz czy sesja CDP jest gotowa", mesh, use_llm=True, llm_model="request/model")
+
+    assert generator["fallback"] is False
+    assert len(calls) == 2
+    assert flow["steps"][0]["uri"] == "kvm://host/cdp/session/query/ready"
+
+
 def test_thin_plan_injects_inventory_beside_drift_for_kvm_steps():
     steps = [{"id": "cap", "uri": "kvm://host/screen/query/capture", "payload": {}}]
 
