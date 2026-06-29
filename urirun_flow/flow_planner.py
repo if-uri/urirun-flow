@@ -541,10 +541,7 @@ def _screenshot_capture_payload(
     low = nl_key(prompt)
     if any(kw in low for kw in _ALL_MONITOR_KWS):
         return {"scope": "all", "monitor": -1}
-    m = re.search(r"\bmonitor(?:ze|a|ow)?\s*(\d+)\b", low)
-    if m:
-        return {"monitor": max(1, int(m.group(1)))}
-    m = re.search(r"\bmonitor(?:ze|a|ow)?\s+numer\s+(\d+)\b", low)
+    m = re.search(r"\bmonitor(?:ze|a|ow)?\s*(?:numer\s+)?(\d+)\b", low)
     if m:
         return {"monitor": max(1, int(m.group(1)))}
     m = re.search(r"\b(\d+)\s+monitor(?:ze|a|ow)?\b", low)
