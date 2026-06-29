@@ -278,16 +278,20 @@ def _provision_cdp_surface(target: str, registry: dict) -> dict:
             "ok": ok, "type": "preflight", "action": "provision-surface"}
 
 
+def _cdp_targets_for_flow(flow: dict) -> list[str]:
+    """Sorted, deduplicated list of node targets that have CDP page steps in the flow."""
+    steps = flow.get("steps") or []
+    return sorted({route_target(str(s.get("uri") or ""))
+                   for s in steps if "/cdp/page/" in str(s.get("uri") or "")})
+
+
 def _preflight(flow: dict, registry: dict) -> list[dict]:
     """Provision the surfaces a flow KNOWS up-front it will need, BEFORE running — proactive,
     not reactive. A flow with ``cdp/page/*`` steps needs a live CDP session; if CDP is feasible
     but not reachable on that node, bring it up once now so the first ``cdp/page`` step doesn't
     fail-then-self-heal. Idempotent (``ensure`` reuses an existing session)."""
-    steps = flow.get("steps") or []
-    cdp_targets = sorted({route_target(str(s.get("uri") or ""))
-                          for s in steps if "/cdp/page/" in str(s.get("uri") or "")})
     entries: list[dict] = []
-    for target in cdp_targets:
+    for target in _cdp_targets_for_flow(flow):
         if not target:
             continue
         prof = _fetch_env_profile({"uri": f"kvm://{target}/_"}, registry) or {}
@@ -849,12 +853,19 @@ def _apply_routing_targets(result: dict, report: dict) -> None:
         for step in (report.get("steps") or [])
         if step.get("runsOn")
     }
+    for uri, target in (report.get("runsOnByStep") or {}).items():
+        if target:
+            runs_on[str(uri)] = target
     if not runs_on:
         return
     for entry in result.get("timeline") or []:
         uri = str(entry.get("uri") or "")
         if uri in runs_on:
             entry["target"] = runs_on[uri]
+            sid = str(entry.get("id") or "")
+            step_result = (result.get("results") or {}).get(sid)
+            if isinstance(step_result, dict):
+                step_result["target"] = runs_on[uri]
 
 
 def execute_flow(flow: dict, mesh: dict, registry: dict, execute: bool, *, recover: bool = True,
