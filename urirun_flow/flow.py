@@ -669,7 +669,13 @@ def _thin_remember_record(flow: dict, nodes: list[str]) -> dict:
     title) + intent signature so /api/twin/state and the twin monitor show a real label, not
     '(no prompt)'. (The richer orchestrator path already stores these; this is the thin path.)"""
     from urirun.node.episode import intent_signature  # noqa: PLC0415
-    prompt = str((flow.get("task") or {}).get("title") or "")
+    task = flow.get("task")
+    if isinstance(task, dict):
+        prompt = str(task.get("title") or task.get("prompt") or "")
+    elif task is None:
+        prompt = ""
+    else:
+        prompt = str(task)
     return {"steps": flow.get("steps") or [], "prompt": prompt,
             "intent_sig": intent_signature(prompt) if prompt else "",
             "nodes": list(nodes), "ok": True}
@@ -754,9 +760,10 @@ def _default_dispatch_uri(execute: bool, registry: dict):
 def _make_flow_envelope(flow: dict, envelope: "FlowEnvelope | None") -> "FlowEnvelope":
     if envelope is not None:
         return envelope
+    task = flow.get("task") if isinstance(flow.get("task"), dict) else {}
     return FlowEnvelope(
-        flow_id=str(flow.get("task", {}).get("id") or ""),
-        goal=flow.get("task") or {},
+        flow_id=str(task.get("id") or ""),
+        goal=task.get("goal") if isinstance(task.get("goal"), dict) else task,
     )
 
 
@@ -1091,10 +1098,11 @@ def _uri_goal_verify(payload: dict) -> dict:
       passed (the envelope sets goal, but without a verification spec there is nothing
       to assert — report honestly rather than silently failing)."""
     import urirun  # noqa: PLC0415
-    goal = payload.get("goal") or {}
+    raw_goal = payload.get("goal") or {}
     results = payload.get("results") or {}
     mesh = payload.get("mesh") or {}
 
+    goal = raw_goal if isinstance(raw_goal, dict) else {}
     goal_uri = goal.get("uri")
     if not goal_uri:
         # No assertion URI — the envelope carries task metadata, not a verifiable spec.
