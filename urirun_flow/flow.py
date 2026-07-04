@@ -726,6 +726,13 @@ def _inventory_steps_for(kvm_targets: list[str], routes_list: list) -> list[dict
     ]
 
 
+def _flow_env_stable(steps: list[dict]) -> bool:
+    """True when NO step can mutate the environment: every step URI is a /query/.
+    Conservative on purpose — any /command/ (click, type, launch, ensure...) forces the
+    remember step back onto a live post-flow probe."""
+    return all(effect_of(str(s.get("uri") or "")) == "query" for s in steps if s.get("uri"))
+
+
 def _build_thin_plan(steps: list[dict], flow: dict, *, execute: bool,
                      memory: "TwinMemory | None" = None,
                      routes: list[dict] | None = None) -> list[dict]:
@@ -754,6 +761,9 @@ def _build_thin_plan(steps: list[dict], flow: dict, *, execute: bool,
         "uri": _THIN_REMEMBER_URI,
         "payload": {"nodes": kvm_targets, "routes": routes_list,
                     "flow_key": flow_key,
+                    # every step is a /query/ → nothing could have mutated the env, so
+                    # remember may reuse the drift probe instead of a fresh dispatch
+                    "env_stable": _flow_env_stable(steps),
                     "record": _thin_remember_record(flow, kvm_targets)},
         "depends_on": [], "optional": True,
     }
@@ -1177,6 +1187,11 @@ def _uri_env_drift(payload: dict) -> dict:
     if not profile:
         return urirun.ok(known=False, drifted=False,
                          skipped="no-profile", next={"kind": "continue"})
+    # drift's probe is LIVE by definition — refresh the short-TTL cache with it so the
+    # inventory and (env_stable) remember steps of THIS flow reuse it instead of paying
+    # another isolated dispatch each (~0.5-0.7 s per probe)
+    from urirun_flow import _env_probe_cache  # noqa: PLC0415
+    _env_probe_cache.put(f"kvm://{node}/env/query/profile", profile)
     memory = durable_memory()
     if memory.known_good(node) is None:
         memory.remember(node, profile)          # sticky first-run baseline
@@ -1204,15 +1219,31 @@ def _uri_env_inventory(payload: dict) -> dict:
     return {**urirun.ok(action="env-inventory"), **_build_env_inventory(node, registry)}
 
 
-def _remember_node_profile(memory, node: str, registry: dict) -> None:
+def _remember_node_profile(memory, node: str, registry: dict,
+                           *, env_stable: bool = False) -> str:
+    """Advance the node's known-good baseline. LIVE probe by default (the flow may have
+    provisioned the environment — e.g. launched a CDP Chrome — and the baseline must be
+    the post-flow state). ``env_stable=True`` means the caller PROVED no step could have
+    mutated the environment (every flow step was a /query/), so the drift step's probe
+    from the start of this very flow (short-TTL cache) is equally live — reusing it cuts
+    a whole isolated-dispatch (~0.5-0.7 s) from every read-only flow's critical path."""
+    from urirun_flow import _env_probe_cache  # noqa: PLC0415
+    key = f"kvm://{node}/env/query/profile"
+    if env_stable:
+        cached = _env_probe_cache.get(key)
+        if isinstance(cached, dict) and cached:
+            memory.remember(node, cached)
+            return "cache"
     try:
-        prof_r = v2_service.call(f"kvm://{node}/env/query/profile",
-                                 {}, registry, mode="execute")
+        prof_r = v2_service.call(key, {}, registry, mode="execute")
         val = (prof_r.get("result") or {}).get("value")
         if isinstance(val, dict) and val:
             memory.remember(node, val)
+            _env_probe_cache.put(key, val)
+            return "live"
     except Exception:  # noqa: BLE001 - best-effort; a missing route is not fatal
         pass
+    return "none"
 
 
 def _uri_memory_remember(payload: dict) -> dict:
@@ -1234,8 +1265,9 @@ def _uri_memory_remember(payload: dict) -> dict:
     registry = registry_from_routes(routes)
     flow_key = str(payload.get("flow_key") or payload.get("flowKey") or "")
     memory = durable_memory()
-    for node in nodes:
-        _remember_node_profile(memory, node, registry)
+    env_stable = bool(payload.get("env_stable"))
+    profile_sources = {node: _remember_node_profile(memory, node, registry, env_stable=env_stable)
+                       for node in nodes}
     record = dict(payload.get("record") or {})
     record.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     remembered = False
@@ -1246,6 +1278,7 @@ def _uri_memory_remember(payload: dict) -> dict:
         remembered = not degraded
     return urirun.ok(remembered=remembered, degraded=degraded,
                      degradedReason=record.get("degradedReason"),
+                     profileSources=profile_sources,
                      nodes=nodes, flowKey=flow_key if flow_key else None)
 
 
