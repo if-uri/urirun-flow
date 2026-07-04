@@ -636,11 +636,15 @@ def _make_memory_dispatch(base_dispatch, memory: TwinMemory, flow: dict, registr
             return {"ok": True, **_build_env_inventory(node, registry)}
 
         if "/memory/command/remember" in uri:
+            # Single source of truth: delegate the per-node baseline advance to
+            # _remember_node_profile (the same helper the URI handler uses), so the
+            # env_stable->cache-reuse optimisation applies on THIS live in-process path
+            # too - previously this branch had its own _live_profile loop that always
+            # paid a fresh probe and ignored env_stable (the Z6/Z11 divergence).
             nodes = payload.get("nodes") or []
-            for node in nodes:
-                profile = _live_profile(node)
-                if profile:
-                    memory.remember(node, profile)
+            env_stable = bool(payload.get("env_stable"))
+            profile_sources = {node: _remember_node_profile(memory, node, registry, env_stable=env_stable)
+                               for node in nodes}
             record = dict(payload.get("record") or {})
             record["flowKey"] = flow_key
             memory.remember_flow(flow_key, record)  # degraded records go to degraded_store, not known-good
@@ -651,7 +655,8 @@ def _make_memory_dispatch(base_dispatch, memory: TwinMemory, flow: dict, registr
                 if hasattr(memory, "remember_proof"):
                     memory.remember_proof(pkey, {"verdict": True, "flowKey": flow_key, **cp})
             return {"ok": True, "remembered": not degraded, "degraded": degraded,
-                    "degradedReason": record.get("degradedReason"), "flowKey": flow_key}
+                    "degradedReason": record.get("degradedReason"), "flowKey": flow_key,
+                    "nodes": nodes, "profileSources": profile_sources}
 
         return base_dispatch(uri, payload)
 
