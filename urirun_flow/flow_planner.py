@@ -996,14 +996,24 @@ def _local_inprocess_query(uri: str, payload: dict | None = None) -> dict | None
         return {"ok": False, "result": None, "error": str(exc)}
 
 
-def _fetch_kvm_query(step: dict, registry: dict, route: str, marker: str) -> dict | None:
+def _fetch_kvm_query(step: dict, registry: dict, route: str, marker: str,
+                     *, use_cache: bool = True) -> dict | None:
     """Best-effort fetch of a kvm read-only query (env/query/profile, surface/query/current)
     for the failing node, so the self-heal fits its remediation to the live machine + surface.
-    None on any hiccup — this context is an optimisation, never a correctness dependency."""
+    None on any hiccup — this context is an optimisation, never a correctness dependency.
+
+    ``use_cache=False`` forces a live probe (Twin memory paths — drift/known-good — must
+    see reality, never a snapshot); the fresh value still refreshes the cache."""
+    from urirun_flow import _env_probe_cache  # noqa: PLC0415
     target = route_target(str(step.get("uri") or ""))
     if not target:
         return None
     candidates = [f"kvm://{target}/{route}"]
+    cache_key = candidates[0]
+    if use_cache and _env_probe_cache.cacheable(cache_key):
+        cached = _env_probe_cache.get(cache_key)
+        if isinstance(cached, dict) and marker in cached:
+            return cached
     routed = _kvm_query_uri_for_node(registry, target, route)
     if routed and routed not in candidates:
         candidates.append(routed)
@@ -1011,6 +1021,8 @@ def _fetch_kvm_query(step: dict, registry: dict, route: str, marker: str) -> dic
         local = _local_inprocess_query(candidates[0], {})
         value = result_data(local) if isinstance(local, dict) else None
         if isinstance(value, dict) and marker in value:
+            if _env_probe_cache.cacheable(cache_key):
+                _env_probe_cache.put(cache_key, value)
             return value
         # For host-targeted calls keep the historical direct path only after the local
         # in-process probe. A remote node can advertise kvm://host/...; callers that mean
@@ -1021,6 +1033,8 @@ def _fetch_kvm_query(step: dict, registry: dict, route: str, marker: str) -> dic
             env = v2_service.call(uri, {}, registry, mode="execute")
             value = result_data(env)
             if isinstance(value, dict) and marker in value:
+                if _env_probe_cache.cacheable(cache_key):
+                    _env_probe_cache.put(cache_key, value)
                 return value
         except Exception:  # noqa: BLE001
             continue
@@ -1133,8 +1147,9 @@ def _planner_context_from_twin(node: str, twin_profile: dict, twin_inventory: di
     return ctx
 
 
-def _fetch_env_profile(step: dict, registry: dict) -> dict | None:
-    return _fetch_kvm_query(step, registry, "env/query/profile", "controlStrategies")
+def _fetch_env_profile(step: dict, registry: dict, *, use_cache: bool = True) -> dict | None:
+    return _fetch_kvm_query(step, registry, "env/query/profile", "controlStrategies",
+                            use_cache=use_cache)
 
 
 def _fetch_surface(step: dict, registry: dict) -> dict | None:

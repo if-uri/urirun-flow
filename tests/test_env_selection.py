@@ -352,3 +352,64 @@ def test_prompt_mentioning_two_labels_still_needs_selection():
 
     assert res["ok"] is False
     assert res["kind"] == "needs-selection"
+
+
+def test_prompt_label_overrides_skip_when_bypass():
+    # LLM boilerplate scope:'all' must not defeat an explicit "monitora DP-2" ask.
+    res = resolve_env_enums(_flow({"monitor": -1, "scope": "all"}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]), prompt="zrob zrzut ekranu monitora DP-2")
+
+    assert res["ok"] is True
+    payload = res["flow"]["steps"][0]["payload"]
+    assert payload["monitor"] == 2
+    assert "scope" not in payload  # the bypass field was dropped
+    assert any(d["source"] == "prompt-label-over-skip" for d in res["decisions"])
+
+
+def test_skip_when_preserved_without_prompt_label():
+    res = resolve_env_enums(_flow({"monitor": -1, "scope": "all"}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]), prompt="zrob zrzut ekranu")
+
+    assert res["ok"] is True
+    payload = res["flow"]["steps"][0]["payload"]
+    assert payload["scope"] == "all"
+    assert any(d["source"] == "skip" for d in res["decisions"])
+
+
+def test_skip_when_preserved_when_prompt_names_two_labels():
+    res = resolve_env_enums(_flow({"scope": "all"}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]), prompt="zrzut wszystkiego z HDMI-1 i DP-2")
+
+    assert res["ok"] is True
+    assert res["flow"]["steps"][0]["payload"]["scope"] == "all"
+
+
+def test_prompt_label_overrides_conflicting_explicit_value():
+    # "monitora DP-1" but the planner guessed monitor:1 (= HDMI-1) — a valid value
+    # pointing at the WRONG monitor. The user's named label wins.
+    res = resolve_env_enums(_flow({"monitor": 1}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+        {"value": 3, "label": "DP-1"},
+    ]), prompt="zrob zrzut ekranu monitora DP-1")
+
+    assert res["ok"] is True
+    assert res["flow"]["steps"][0]["payload"]["monitor"] == 3
+    assert any(d["source"] == "prompt-label-over-explicit" for d in res["decisions"])
+
+
+def test_explicit_value_kept_when_prompt_agrees_or_names_nothing():
+    inv = _inventory([{"value": 1, "label": "HDMI-1"}, {"value": 2, "label": "DP-2"}])
+    # numeric-only prompt: no label named, model's explicit value stands
+    res = resolve_env_enums(_flow({"monitor": 2}), ROUTES, inv, prompt="zrob zrzut monitora 2")
+    assert res["flow"]["steps"][0]["payload"]["monitor"] == 2
+    assert any(d["source"] == "explicit" for d in res["decisions"])
+    # prompt names the SAME option the model chose — stays explicit, no churn
+    res = resolve_env_enums(_flow({"monitor": 2}), ROUTES, inv, prompt="zrzut ekranu DP-2")
+    assert res["flow"]["steps"][0]["payload"]["monitor"] == 2

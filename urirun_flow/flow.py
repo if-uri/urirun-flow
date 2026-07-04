@@ -373,7 +373,7 @@ def _capture_known_good(flow: dict, registry: dict, memory: TwinMemory) -> None:
     for target in _kvm_targets(flow):
         if memory.known_good(target) is not None:
             continue                                    # baseline already established; keep it sticky
-        prof = _fetch_env_profile({"uri": f"kvm://{target}/_"}, registry)
+        prof = _fetch_env_profile({"uri": f"kvm://{target}/_"}, registry, use_cache=False)
         if isinstance(prof, dict):
             memory.remember(target, prof)
 
@@ -383,7 +383,7 @@ def _update_known_good(flow: dict, registry: dict, memory: TwinMemory) -> None:
     Unlike _capture_known_good (sticky first-run baseline), this unconditionally overwrites
     so that drift is always measured against the last successfully executed state."""
     for target in _kvm_targets(flow):
-        prof = _fetch_env_profile({"uri": f"kvm://{target}/_"}, registry)
+        prof = _fetch_env_profile({"uri": f"kvm://{target}/_"}, registry, use_cache=False)
         if isinstance(prof, dict):
             memory.remember(target, prof)
 
@@ -394,7 +394,8 @@ def _drift_timeline(flow: dict, registry: dict, memory: TwinMemory) -> list[dict
     the flow continues so an operator (or the recovery layer) decides what a drift means."""
     entries: list[dict] = []
     for target in _kvm_targets(flow):
-        prof = _fetch_env_profile({"uri": f"kvm://{target}/_"}, registry)
+        # use_cache=False: drift must compare the LIVE environment to the baseline.
+        prof = _fetch_env_profile({"uri": f"kvm://{target}/_"}, registry, use_cache=False)
         if not isinstance(prof, dict):
             continue
         d = memory.drift(target, prof)
@@ -454,12 +455,21 @@ def _restore_service_map(old: str | None) -> None:
 
 
 def _call_route_value(uri: str, payload: dict, registry: dict) -> dict:
+    from urirun_flow import _env_probe_cache  # noqa: PLC0415
+    if _env_probe_cache.cacheable(uri, payload):
+        cached = _env_probe_cache.get(uri)
+        if cached is not None:
+            return cached
     try:
         env = v2_service.call(uri, payload or {}, registry, mode="execute")
         if isinstance(env, dict) and env.get("ok") is False:
             return {}
         val = result_data(env)
-        return val if isinstance(val, dict) else {}
+        if not isinstance(val, dict):
+            return {}
+        if _env_probe_cache.cacheable(uri, payload):
+            _env_probe_cache.put(uri, val)
+        return val
     except Exception:  # noqa: BLE001 - inventory is advisory; missing routes become empty sections.
         return {}
 
@@ -598,7 +608,10 @@ def _make_memory_dispatch(base_dispatch, memory: TwinMemory, flow: dict, registr
     def _live_profile(node: str) -> dict:
         # Use _fetch_env_profile for consistency with the orchestrator path and
         # testability (tests that patch _fetch_env_profile work unchanged).
-        prof = _fetch_env_profile({"uri": f"kvm://{node}/_"}, registry)
+        # use_cache=False: Twin memory (drift check, known-good baseline) must compare
+        # against REALITY — a cached snapshot would record stale baselines and blind
+        # drift detection. The live value still refreshes the cache for later probes.
+        prof = _fetch_env_profile({"uri": f"kvm://{node}/_"}, registry, use_cache=False)
         return prof if isinstance(prof, dict) else {}
 
     def dispatch(uri: str, payload: dict) -> dict:

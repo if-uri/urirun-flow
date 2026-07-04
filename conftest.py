@@ -50,3 +50,14 @@ _flow_mod = sys.modules.get("urirun_flow")
 if _flow_mod is not None and not str(getattr(_flow_mod, "__file__", "")).startswith(_LOCAL):
     for name in [n for n in list(sys.modules) if n == "urirun_flow" or n.startswith("urirun_flow.")]:
         del sys.modules[name]
+
+
+# Isolate the short-TTL env-probe cache between tests (see urirun_flow/_env_probe_cache.py).
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _clear_env_probe_cache():
+    from urirun_flow import _env_probe_cache
+    _env_probe_cache.clear()
+    yield

@@ -96,6 +96,18 @@ def _skip_by_payload(payload: dict, cfg: dict) -> bool:
     return False
 
 
+def _drop_skip_fields(payload: dict, cfg: dict) -> None:
+    """Remove the payload fields whose values trigger this domain's skipWhen bypass.
+
+    Used when the prompt names one concrete option: the bypass value (e.g. capture
+    scope:'all') was planner boilerplate, not user intent — dropping it lets the
+    explicitly grounded option take effect."""
+    for key, allowed in (cfg.get("skipWhen") or {}).items():
+        val = str(payload.get(key) or "").strip().lower()
+        if val and val in {str(x).strip().lower() for x in (allowed or [])}:
+            payload.pop(key, None)
+
+
 def _has_explicit(payload: dict, param: str, cfg: dict) -> bool:
     if param not in payload:
         return False
@@ -289,6 +301,17 @@ def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dic
             if not isinstance(cfg, dict) or cfg.get("type") != "enum" or not cfg.get("domain"):
                 continue
             if _skip_by_payload(payload, cfg):
+                # A prompt that names exactly ONE option label overrides the bypass:
+                # "zrzut ekranu monitora HDMI-1" with a planner-emitted scope:'all' means
+                # the user wants THAT monitor — the skip value was boilerplate.
+                skip_options = _domain_options(inventory, str(cfg["domain"]))
+                prompt_value = _option_from_prompt(skip_options, prompt)
+                if prompt_value is not None and prompt_value in _option_values(skip_options):
+                    _drop_skip_fields(payload, cfg)
+                    payload[param] = prompt_value
+                    decisions.append({"uri": uri, "parameter": param,
+                                      "source": "prompt-label-over-skip", "value": prompt_value})
+                    continue
                 decisions.append({"uri": uri, "parameter": param, "source": "skip"})
                 continue
             if _has_result_reference(payload, str(param)):
@@ -304,6 +327,16 @@ def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dic
                     payload[param] = coerced
                     decisions.append({"uri": uri, "parameter": param, "source": "label",
                                       "value": coerced})
+                    continue
+                # Valid-but-conflicting guard: the user named ONE option by label and the
+                # planner's numeric value points at a different one ("monitora DP-1" but
+                # monitor:1 = HDMI-1) — the user's label wins over the model's guess.
+                prompt_value = _option_from_prompt(options, prompt)
+                if (prompt_value is not None and prompt_value in _option_values(options)
+                        and _value_key(prompt_value) != _value_key(payload.get(param))):
+                    payload[param] = prompt_value
+                    decisions.append({"uri": uri, "parameter": param,
+                                      "source": "prompt-label-over-explicit", "value": prompt_value})
                     continue
                 decisions.append({"uri": uri, "parameter": param, "source": "explicit"})
                 continue

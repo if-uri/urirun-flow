@@ -549,10 +549,15 @@ def _thin_dispatch_step(step: dict, envelope: FlowEnvelope, dispatch_uri,
         payload = _enrich_remember_with_degraded(payload, results, timeline=timeline)
     envelope.record(uri, "call")
 
+    _t0 = time.monotonic()
     r = dispatch_uri(uri, payload)
+    # Per-step wall-clock on the timeline: the data for "where does execute time go"
+    # (probe vs capture vs dispatch overhead) without re-running under a profiler.
+    _step_ms = round((time.monotonic() - _t0) * 1000.0, 1)
 
     if step.get("optional"):
         timeline.append(_thin_step_entry(sid, uri, r))
+        timeline[-1]["ms"] = _step_ms
         results[sid] = r
         return _DISPATCH_CONTINUE
 
@@ -561,6 +566,7 @@ def _thin_dispatch_step(step: dict, envelope: FlowEnvelope, dispatch_uri,
     envelope.record(uri, "return", ok=r.get("ok", True), next=kind)
     _thin_update_ledger(envelope, uri, r)
     timeline.append(_thin_step_entry(sid, uri, r))
+    timeline[-1]["ms"] = _step_ms
     results[sid] = r
 
     if not r.get("ok", True) and kind == "continue":
