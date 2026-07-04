@@ -1,0 +1,10 @@
+# local.dev.txt — locally developed dependencies of this project (generated 2026-07-04)
+# by ~/github/local.dev.sh — DO NOT EDIT; see ~/github/local.dev.md
+# project: urirun-flow 0.2.2 (python) at /home/tom/github/if-uri/urirun-flow
+# deps declared: 6 | with local source: 2
+
+## LOCAL DEPS  (dep | required | local source (version) | installed | status)
+urirun | >=0.4.190 | /home/tom/github/if-uri/urirun/adapters/python (0.4.190) | 0.4.190 editable | OK-EDITABLE  [pyproject.toml[run]]
+urirun-connector-router | >=0.2.0 | /home/tom/github/if-uri/urirun-connector-router (0.2.0) | 0.2.0 editable | OK-EDITABLE  [pyproject.toml]
+
+## EXTERNAL DEPS (no local source, 4): litellm, pydantic, pytest, pyyaml
