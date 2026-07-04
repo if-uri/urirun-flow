@@ -1113,7 +1113,7 @@ def rollback_flow(execution: dict, mesh: dict, *, scan_uri: str | None = None) -
 # These make the orchestrator's internal operations addressable on the mesh so
 # the thin driver (and remote callers) can route to them by URI.
 
-def _uri_goal_verify(payload: dict) -> dict:
+def _uri_goal_verify(payload: dict | None = None, *, goal=None, results=None, mesh=None, **_) -> dict:
     """Handler for twin://<node>/flow/goal/query/verify.
 
     Payload: {goal: {uri, path?, contains?, equals?, present?}, results: {…}, mesh?: {…}}
@@ -1126,6 +1126,9 @@ def _uri_goal_verify(payload: dict) -> dict:
     • goal has no `uri` (e.g. {reached: true} from FlowEnvelope) → treat as trivially
       passed (the envelope sets goal, but without a verification spec there is nothing
       to assert — report honestly rather than silently failing)."""
+    if payload is None:
+        payload = {"goal": goal, "results": results, "mesh": mesh}
+
     import urirun  # noqa: PLC0415
     raw_goal = payload.get("goal") or {}
     results = payload.get("results") or {}
@@ -1146,7 +1149,7 @@ def _uri_goal_verify(payload: dict) -> dict:
             "next": {"kind": "done" if passed else "rollback"}}
 
 
-def _uri_preflight(payload: dict) -> dict:
+def _uri_preflight(payload: dict | None = None, *, steps=None, mesh=None, **_) -> dict:
     """Handler for twin://<node>/flow/command/preflight.
 
     Payload: {steps: […], mesh?: {…}}
@@ -1155,6 +1158,9 @@ def _uri_preflight(payload: dict) -> dict:
     Called by _thin_driver before the main loop when the plan has CDP steps.
     Provisions CDP sessions proactively so the first cdp/page step doesn't
     fail-then-self-heal."""
+    if payload is None:
+        payload = {"steps": steps, "mesh": mesh}
+
     import urirun  # noqa: PLC0415
     steps = payload.get("steps") or []
     mesh = payload.get("mesh") or {}
@@ -1165,7 +1171,7 @@ def _uri_preflight(payload: dict) -> dict:
     return {**urirun.ok(ok=all_ok), "timeline": entries, "count": len(entries)}
 
 
-def _uri_env_drift(payload: dict) -> dict:
+def _uri_env_drift(payload: dict | None = None, *, node=None, routes=None, **_) -> dict:
     """Handler for twin://<node>/env/query/drift.
 
     Payload: {node, routes?: [{…}]}
@@ -1177,6 +1183,9 @@ def _uri_env_drift(payload: dict) -> dict:
     Always returns next: {kind: continue} — drift is advisory, never abort.
 
     Uses twin_store.durable_memory() so the baseline persists across restarts."""
+    if payload is None:
+        payload = {"node": node, "routes": routes}
+
     import urirun  # noqa: PLC0415
     from urirun.node.twin_store import durable_memory  # noqa: PLC0415
     node = payload.get("node") or "host"
@@ -1208,7 +1217,7 @@ def _uri_env_drift(payload: dict) -> dict:
     return result
 
 
-def _uri_env_inventory(payload: dict) -> dict:
+def _uri_env_inventory(payload: dict | None = None, *, node=None, routes=None, **_) -> dict:
     """Handler for twin://<node>/env/query/inventory.
 
     Returns structured degrees of freedom for the planner: monitor options,
@@ -1216,6 +1225,9 @@ def _uri_env_inventory(payload: dict) -> dict:
     drift: drift answers "did the known-good profile change?", inventory answers
     "what concrete choices exist before dispatch?".
     """
+    if payload is None:
+        payload = {"node": node, "routes": routes}
+
     import urirun  # noqa: PLC0415
 
     node = payload.get("node") or "host"
@@ -1251,18 +1263,24 @@ def _remember_node_profile(memory, node: str, registry: dict,
     return "none"
 
 
-def _uri_memory_remember(payload: dict) -> dict:
+def _uri_memory_remember(payload: dict | None = None, *, nodes=None, routes=None, flow_key="",
+                         flowKey="", record=None, env_stable=False, **_) -> dict:
     """Handler for twin://host/memory/command/remember.
 
-    Payload: {nodes: [str], routes?: [{…}], flow_key?: str,
-              record: {steps: […], …}}
-    Returns: {ok, remembered: bool, nodes: […], flowKey?: str}
+    In-core connector handlers are dispatched with NAMED kwargs by the binding
+    runtime (the compiled schema demands a literal 'payload' property otherwise —
+    the fallback path then fails 'payload is a required property'). We accept both:
+    a positional payload dict (tests / direct calls) and named fields (mesh dispatch).
 
-    Updates the known-good environment profile for each node (unconditional
-    overwrite — advances the baseline to the just-completed successful state),
-    then stores the flow record keyed by flow_key for recall/replay.
+    Fields: {nodes: [str], routes?: [{…}], flow_key?: str, env_stable?: bool,
+             record: {steps: […], …}}
+    Returns: {ok, remembered, degraded, flowKey, nodes, profileSources}
 
-    Uses twin_store.durable_memory() for durable persistence."""
+    Advances each node's known-good baseline (env_stable reuses the drift probe via
+    cache) and stores the flow record keyed by flow_key for recall/replay."""
+    if payload is None:
+        payload = {"nodes": nodes, "routes": routes, "flow_key": flow_key,
+                   "flowKey": flowKey, "record": record, "env_stable": env_stable}
     import urirun  # noqa: PLC0415
     from urirun.node.twin_store import durable_memory  # noqa: PLC0415
     nodes = payload.get("nodes") or []

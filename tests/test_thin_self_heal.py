@@ -88,3 +88,27 @@ def test_unrecognized_failure_rolls_back_without_heal():
 
     assert result["ok"] is False
     assert not any(e.get("id") == "nav:self-heal" for e in result["timeline"])
+
+
+# ---- in-core flow handlers must accept named kwargs (mesh/fallback dispatch) ----
+
+def test_flow_handlers_accept_named_kwargs():
+    """The binding runtime dispatches in-core handlers with NAMED kwargs, not a
+    'payload' dict. Regression: signatures were def h(payload: dict) → compiled schema
+    required a literal 'payload' property → fallback path failed 'payload is a required
+    property'. Each handler must accept its fields as kwargs AND a positional dict."""
+    import urirun_flow.flow as F
+
+    # named-kwargs form (what mesh dispatch passes)
+    r = F._uri_memory_remember(nodes=["host"], routes=[], env_stable=True, flow_key="k")
+    assert r["ok"] and "profileSources" in r and r.get("nodes") == ["host"]
+    d = F._uri_env_drift(node="host", routes=[])
+    assert d["ok"] and "next" in d
+    inv = F._uri_env_inventory(node="host", routes=[])
+    assert inv["ok"]
+    g = F._uri_goal_verify(goal={}, results={})
+    assert isinstance(g, dict) and "ok" in g
+
+    # positional dict form (tests / direct callers) still works
+    r2 = F._uri_memory_remember({"nodes": ["host"], "routes": [], "flow_key": "k2"})
+    assert r2["ok"]
