@@ -4,7 +4,7 @@
 # deps declared: 6 | with local source: 2
 
 ## LOCAL DEPS  (dep | required | local source (version) | installed | status)
-urirun | >=0.4.190 | /home/tom/github/if-uri/urirun/adapters/python (0.4.190) | 0.4.190 editable | OK-EDITABLE  [pyproject.toml[run]]
-urirun-connector-router | >=0.2.0 | /home/tom/github/if-uri/urirun-connector-router (0.2.0) | 0.2.0 editable | OK-EDITABLE  [pyproject.toml]
+urirun | >=0.4.190 | /home/tom/github/if-uri/urirun/adapters/python (0.4.190) | 0.4.190 editable @if-uri/venv | OK-EDITABLE  [pyproject.toml[run]]
+urirun-connector-router | >=0.2.0 | /home/tom/github/if-uri/urirun-connector-router (0.2.0) | 0.2.0 editable @if-uri/venv | OK-EDITABLE  [pyproject.toml]
 
 ## EXTERNAL DEPS (no local source, 4): litellm, pydantic, pytest, pyyaml
