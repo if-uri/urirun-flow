@@ -929,7 +929,8 @@ def execute_flow(flow: dict, mesh: dict, registry: dict, execute: bool, *, recov
                               registry=registry, execute=execute,
                               max_retries=max_retries,
                               max_remediations=max_remediations,
-                              max_wall_clock=max_wall_clock)
+                              max_wall_clock=max_wall_clock,
+                              recover=recover)
         if isinstance(result, dict):
             result.setdefault("routing", routing_report)
             _apply_routing_targets(result, routing_report)

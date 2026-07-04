@@ -268,9 +268,69 @@ def _thin_handle_acquire(r: dict, sid: str, uri: str, payload: dict,
     return False, out
 
 
+_AUTO_HEAL_KINDS = {"provision", "precondition", "retry", "discovery"}
+
+
+def _thin_fetch_env(dispatch_uri, node: str) -> "dict | None":
+    """Best-effort ``env/query/profile`` so the diagnosis is env-fitted (this is what
+    enables surface escalation on Wayland). Any failure degrades to an un-fitted
+    diagnosis — the probe must never block or fail the heal attempt."""
+    try:
+        r = dispatch_uri(f"kvm://{node}/env/query/profile", {})
+        if not isinstance(r, dict):
+            return None
+        inner = result_data(r)
+        prof = inner if isinstance(inner, dict) else r
+        return prof if prof.get("ok", True) else None
+    except Exception:  # noqa: BLE001 - advisory probe
+        return None
+
+
+def _thin_self_heal(r: dict, step: dict, sid: str, uri: str, payload: dict,
+                    envelope: FlowEnvelope, dispatch_uri, timeline: list,
+                    results: dict) -> "tuple[bool, dict | None]":
+    """One diagnose→remediate→retry attempt for a SYNTHESIZED step failure — the thin
+    twin of flow.py's ``_attempt_self_heal`` (before this, the thin path rolled back on
+    the first failure while the full engine healed). Bounded hard: at most ONE heal per
+    step (timeline marker), only ``automatic`` remediations whose kind is allow-listed
+    (payload/auth/diagnostic stay human-gated), and the retry books ``healed=True`` so
+    the envelope's remediation/retry circuit-breaker caps still apply globally.
+    Returns (attempted, early_exit): attempted=False → caller proceeds to rollback."""
+    # both imports lazy: recovery/diagnostics pull heavier deps and flow_thin's pure
+    # helpers must stay importable without urirun_runtime (test_light_imports gate)
+    from urirun_flow.diagnostics import diagnose
+    from urirun_flow.recovery import normalize_error
+    heal_id = f"{sid}:self-heal"
+    if any(e.get("id") == heal_id for e in timeline):
+        return False, None                    # heal-once per step
+    error = normalize_error(r.get("error"), uri=uri)
+    node = route_target(uri) or "host"
+    diag = diagnose(error, step=step, environment=_thin_fetch_env(dispatch_uri, node))
+    if not diag or not diag.get("autoApplicable"):
+        return False, None                    # nothing safely automatic → honest rollback
+    applied = []
+    for action in diag.get("remediation") or []:
+        if not (action.get("automatic") and action.get("uri")
+                and action.get("kind") in _AUTO_HEAL_KINDS):
+            continue
+        res = dispatch_uri(action["uri"], action.get("payload") or {})
+        applied.append({"id": action.get("id"), "uri": action["uri"],
+                        "ok": bool(isinstance(res, dict) and res.get("ok"))})
+    if not any(a["ok"] for a in applied):
+        return False, None                    # heal achieved nothing → rollback
+    timeline.append({"id": heal_id, "uri": uri, "ok": True, "action": "self-heal",
+                     "target": node, "rule": diag.get("rule"), "applied": applied})
+    envelope.record(uri, "self-heal", rule=diag.get("rule"),
+                    applied=[a["id"] for a in applied if a["ok"]])
+    early = _thin_retry_once(sid, uri, payload, envelope, dispatch_uri, timeline, results,
+                             healed=True,
+                             extra={"action": "self-heal-retry", "rule": diag.get("rule")})
+    return True, early
+
+
 def _thin_handle_non_continue(kind: str, r: dict, step: dict, sid: str, uri: str, payload: dict,
                                envelope: FlowEnvelope, dispatch_uri, timeline: list,
-                               results: dict) -> tuple[bool, dict | None]:
+                               results: dict, *, recover: bool = True) -> tuple[bool, dict | None]:
     """Process step result kinds other than 'continue'.
     Returns (should_break, early_return).  early_return=None means proceed in loop."""
     if kind == "retry":
@@ -284,6 +344,13 @@ def _thin_handle_non_continue(kind: str, r: dict, step: dict, sid: str, uri: str
         # explicit=True when step intentionally returned next.kind="rollback"; False when
         # synthesised by _next_kind from ok=False (no next.kind in the result).
         explicit_rb = bool((r.get("next") or {}).get("kind") == "rollback")
+        if not explicit_rb and recover:
+            # a synthesized failure gets ONE diagnose→remediate→retry before we give up;
+            # recover=False (caller opted out) and an explicit rollback intent both skip it
+            attempted, early = _thin_self_heal(r, step, sid, uri, payload, envelope,
+                                               dispatch_uri, timeline, results)
+            if attempted:
+                return False, early
         return False, _thin_rollback(dispatch_uri, envelope, timeline, results, "failed",
                                      error=err, explicit=explicit_rb)
     return kind == "done", None  # done → break; unknown → continue
@@ -506,7 +573,8 @@ def _irreversible_skip(step: dict, uri: str, results: dict, timeline: list, sid:
 
 
 def _thin_dispatch_step(step: dict, envelope: FlowEnvelope, dispatch_uri,
-                        timeline: list, results: dict, *, execute: bool) -> "dict | object":
+                        timeline: list, results: dict, *, execute: bool,
+                        recover: bool = True) -> "dict | object":
     """Execute one step and return:
     - an early-exit dict  (flow abort — caller must return it)
     - _DISPATCH_BREAK     (flow is done — caller must break)
@@ -578,7 +646,8 @@ def _thin_dispatch_step(step: dict, envelope: FlowEnvelope, dispatch_uri,
     if kind == "continue":
         return _DISPATCH_CONTINUE
     should_break, early = _thin_handle_non_continue(
-        kind, r, step, sid, uri, payload, envelope, dispatch_uri, timeline, results)
+        kind, r, step, sid, uri, payload, envelope, dispatch_uri, timeline, results,
+        recover=recover)
     if early is not None:
         return early
     return _DISPATCH_BREAK if should_break else _DISPATCH_CONTINUE
@@ -595,6 +664,7 @@ def _thin_driver(
     max_remediations: int = 6,
     max_wall_clock: float = 180.0,
     preflight: bool = False,  # no-op: preflight is now injected by _plan_with_preflight
+    recover: bool = True,     # gates the one-shot self-heal on synthesized failures
 ) -> dict:
     """Uniform follow-the-intent loop.  No retry branch, no heal branch, no rollback branch.
     Every decision is made by flow-aware processes and returned as `next.kind` in the result.
@@ -614,7 +684,8 @@ def _thin_driver(
         if brk is not None:
             return brk
         envelope.position = i
-        outcome = _thin_dispatch_step(step, envelope, dispatch_uri, timeline, results, execute=execute)
+        outcome = _thin_dispatch_step(step, envelope, dispatch_uri, timeline, results,
+                                      execute=execute, recover=recover)
         if outcome is _DISPATCH_BREAK:
             break
         if outcome is not _DISPATCH_CONTINUE:
