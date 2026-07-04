@@ -210,6 +210,29 @@ def _canonicalize_template_refs(payload: dict) -> dict:
     return out
 
 
+def _mask_invalid_domain_values(payload: dict, schema: dict, route: dict) -> dict:
+    """Replace contract-domain enum params whose value fails the property schema with a
+    typed placeholder for validation purposes only.
+
+    A label-like value ('DP-2' where the contract wants an int monitor index) is a
+    deferred input, not a plan error: env-enum resolution grounds it later (label
+    coercion / preference / needs-selection). Hard-failing here would discard the
+    whole LLM plan over a parameter the resolver owns anyway."""
+    domains = ((route.get("meta") or {}).get("contract") or {}).get("domains") or {}
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not domains or not isinstance(props, dict):
+        return payload
+    import jsonschema  # noqa: PLC0415
+    out = dict(payload)
+    for param in domains:
+        if param in out and param in props:
+            try:
+                jsonschema.validate(instance=out[param], schema=props[param] or {})
+            except jsonschema.ValidationError:
+                out[param] = _schema_placeholder(props[param] or {})
+    return out
+
+
 def _validate_step_payload(uri: str, payload: dict, routes: "list[dict] | None") -> None:
     """Raise ValueError when routes include an inputSchema that payload doesn't satisfy."""
     if not routes:
@@ -220,6 +243,7 @@ def _validate_step_payload(uri: str, payload: dict, routes: "list[dict] | None")
     import jsonschema  # noqa: PLC0415
     schema = route["inputSchema"]
     validation_payload = _payload_for_schema_validation(payload, schema)
+    validation_payload = _mask_invalid_domain_values(validation_payload, schema, route)
     try:
         jsonschema.validate(instance=validation_payload, schema=schema)
     except jsonschema.ValidationError as e:

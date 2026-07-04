@@ -297,3 +297,58 @@ def test_resolve_flow_env_enums_is_flow_level_single_entrypoint():
     assert calls == ["host"]
     assert res["inventories"]["host"]["fingerprint"] == "env-print"
     assert res["flow"]["steps"][0]["payload"]["printer"] == "hp"
+
+
+# ── label coercion + prompt-label grounding ──────────────────────────────────
+
+def test_label_value_is_coerced_to_option_value():
+    # LLM planners name the human label ('DP-2') where the contract wants the index.
+    res = resolve_env_enums(_flow({"monitor": "DP-2"}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1", "connector": "HDMI-1"},
+        {"value": 2, "label": "DP-2", "connector": "DP-2"},
+    ]))
+
+    assert res["ok"] is True
+    assert res["flow"]["steps"][0]["payload"]["monitor"] == 2
+    assert res["decisions"][0]["source"] == "label"
+
+
+def test_label_coercion_is_case_and_diacritic_insensitive():
+    res = resolve_env_enums(_flow({"monitor": "dp-2"}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]))
+
+    assert res["ok"] is True
+    assert res["flow"]["steps"][0]["payload"]["monitor"] == 2
+
+
+def test_unknown_label_still_rejected_as_invalid():
+    res = resolve_env_enums(_flow({"monitor": "VGA-9"}), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]))
+
+    assert res["ok"] is False
+    assert res["kind"] == "env-domain-invalid"
+
+
+def test_prompt_label_resolves_unset_enum():
+    res = resolve_env_enums(_flow(), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]), prompt="zrob zrzut ekranu monitora DP-2")
+
+    assert res["ok"] is True
+    assert res["flow"]["steps"][0]["payload"]["monitor"] == 2
+    assert any(d["source"] == "prompt-label" for d in res["decisions"])
+
+
+def test_prompt_mentioning_two_labels_still_needs_selection():
+    res = resolve_env_enums(_flow(), ROUTES, _inventory([
+        {"value": 1, "label": "HDMI-1"},
+        {"value": 2, "label": "DP-2"},
+    ]), prompt="porownaj HDMI-1 i DP-2")
+
+    assert res["ok"] is False
+    assert res["kind"] == "needs-selection"

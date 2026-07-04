@@ -155,6 +155,43 @@ def _primary_option_value(options: list[dict]) -> Any:
     return None
 
 
+def _option_label_keys(opt: dict) -> set:
+    keys = set()
+    for field in ("label", "connector", "displayName", "name"):
+        value = opt.get(field)
+        if isinstance(value, str) and value.strip():
+            keys.add(_nl_key(value.strip()))
+    return keys
+
+
+def _option_by_label(options: list[dict], value: Any) -> Any:
+    """Coerce a label-like explicit value ('DP-2', 'AOC 32"') to its option value.
+
+    LLM planners routinely name the human label instead of the contract's value
+    (a monitor index); grounding the label here keeps the plan instead of
+    discarding it as env-domain-invalid."""
+    key = _nl_key(str(value if value is not None else "").strip())
+    if not key:
+        return None
+    for opt in options:
+        if key in _option_label_keys(opt):
+            return opt.get("value")
+    return None
+
+
+def _option_from_prompt(options: list[dict], prompt: str) -> Any:
+    """Pick the option whose label appears in the prompt, when exactly one does.
+
+    'zrob zrzut ekranu monitora DP-2' resolves monitor=2 without a needs-selection
+    round-trip; ambiguous prompts (two labels mentioned) still fall through."""
+    text = _nl_key(prompt)
+    if not text:
+        return None
+    hits = [opt.get("value") for opt in options
+            if any(k and k in text for k in _option_label_keys(opt))]
+    return hits[0] if len(hits) == 1 else None
+
+
 def _env_domain_invalid(uri: str, node: str, param: str, cfg: dict, value: Any,
                         options: list[dict]) -> dict:
     return {
@@ -261,7 +298,13 @@ def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dic
             options = _domain_options(inventory, str(cfg["domain"]))
             if _has_explicit(payload, param, cfg):
                 if options and _value_key(payload.get(param)) not in _option_value_keys(options):
-                    return {**_env_domain_invalid(uri, node, param, cfg, payload.get(param), options), "flow": flow}
+                    coerced = _option_by_label(options, payload.get(param))
+                    if coerced is None:
+                        return {**_env_domain_invalid(uri, node, param, cfg, payload.get(param), options), "flow": flow}
+                    payload[param] = coerced
+                    decisions.append({"uri": uri, "parameter": param, "source": "label",
+                                      "value": coerced})
+                    continue
                 decisions.append({"uri": uri, "parameter": param, "source": "explicit"})
                 continue
             if len(options) == 1:
@@ -276,10 +319,16 @@ def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dic
                                   "value": pref_value})
                 continue
             primary_value = _primary_option_value(options) if _prompt_requests_primary(prompt) else None
-            if primary_value in _option_values(options):
+            if primary_value is not None and primary_value in _option_values(options):
                 payload[param] = primary_value
                 decisions.append({"uri": uri, "parameter": param, "source": "primary",
                                   "value": primary_value})
+                continue
+            prompt_value = _option_from_prompt(options, prompt)
+            if prompt_value is not None and prompt_value in _option_values(options):
+                payload[param] = prompt_value
+                decisions.append({"uri": uri, "parameter": param, "source": "prompt-label",
+                                  "value": prompt_value})
                 continue
             if len(options) > 1:
                 return {**_needs_selection(uri, node, param, cfg, options, inventory), "flow": flow}
