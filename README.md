@@ -1,5 +1,18 @@
 # urirun-flow
 
+
+## AI Cost Tracking
+
+![PyPI](https://img.shields.io/badge/pypi-costs-blue) ![Version](https://img.shields.io/badge/version-0.2.3-blue) ![Python](https://img.shields.io/badge/python-3.9+-blue) ![License](https://img.shields.io/badge/license-Apache--2.0-green)
+![AI Cost](https://img.shields.io/badge/AI%20Cost-$0.52-orange) ![Human Time](https://img.shields.io/badge/Human%20Time-29.3h-blue) ![Model](https://img.shields.io/badge/Model-openrouter%2Fqwen%2Fqwen3--coder--next-lightgrey)
+
+- 🤖 **LLM usage:** $0.5160 (30 commits)
+- 👤 **Human dev:** ~$2928 (29.3h @ $100/h, 30min dedup)
+
+Generated on 2026-07-05 using [openrouter/qwen/qwen3-coder-next](https://openrouter.ai/qwen/qwen3-coder-next)
+
+---
+
 Author urirun **URI flows** in a typed programming language, and convert them
 to/from the canonical YAML flow format — the way **Pydantic** gives data a typed,
 validated model that serializes to a schema.
@@ -68,4 +81,5 @@ flow in every language and asserts they agree — like `make conformance` for co
 bindings. Verified: **2/2 emitters agree** (Python + JS).
 
 ## License
-Apache-2.0 — see [LICENSE](LICENSE) / [NOTICE](NOTICE).
+
+Licensed under Apache-2.0.

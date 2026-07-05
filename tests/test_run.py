@@ -1,3 +1,5 @@
+import pytest as _pytest_guard  # noqa: E402
+_pytest_guard.importorskip("jsonschema")  # integration tests need the full urirun runtime (not in the isolated package-test env)
 """urirun-flow run: a typed flow executes through urirun with `_from` chaining."""
 import json, pathlib
 import pytest

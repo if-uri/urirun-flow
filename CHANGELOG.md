@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.2.3] - 2026-07-05
+
+### Docs
+- Update README.md
+
+### Test
+- Update tests/test_dataflow_reference_class.py
+- Update tests/test_flow_planner_helpers.py
+- Update tests/test_remember_env_stable.py
+- Update tests/test_run.py
+
+### Other
+- Update uv.lock
+
+
 All notable changes to **urirun-flow** ([Keep a Changelog](https://keepachangelog.com), [SemVer](https://semver.org)).
 
 ## [0.2.2]

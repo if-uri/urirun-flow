@@ -3,6 +3,8 @@ template matching, JSON extraction). These live with the flow package — they n
 ``urirun_flow``, no hub runtime. Moved here from the monorepo hub so the package owns its own
 helper coverage (the hub keeps the integration tests that exercise execution through the shim)."""
 from __future__ import annotations
+import pytest as _pytest_guard  # noqa: E402
+_pytest_guard.importorskip("jsonschema")  # integration tests need the full urirun runtime (not in the isolated package-test env)
 
 import json
 

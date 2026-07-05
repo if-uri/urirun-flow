@@ -5,6 +5,8 @@
 was PROVABLY read-only (every step a /query/); any /command/ forces a live post-flow
 probe because the flow itself may have provisioned the environment."""
 from __future__ import annotations
+import pytest as _pytest_guard  # noqa: E402
+_pytest_guard.importorskip("jsonschema")  # integration tests need the full urirun runtime (not in the isolated package-test env)
 
 import urirun_flow.flow as F
 from urirun_flow import _env_probe_cache

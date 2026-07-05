@@ -10,6 +10,8 @@ generically (over every ``*_from``, not just ``monitor_from``):
   mode 3 — ref to a LATER step (producer after consumer)-> REJECT (impossible data flow)
 """
 from __future__ import annotations
+import pytest as _pytest_guard  # noqa: E402
+_pytest_guard.importorskip("jsonschema")  # integration tests need the full urirun runtime (not in the isolated package-test env)
 
 import pytest
 
