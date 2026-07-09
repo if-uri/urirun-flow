@@ -49,6 +49,15 @@ def quiet_completion(**kwargs):
     defaulted = "max_tokens" not in kwargs and "max_completion_tokens" not in kwargs
     if defaulted:
         kwargs = {**kwargs, "max_tokens": _default_max_tokens()}
+    if "api_base" not in kwargs:
+        api_base = (
+            os.getenv("URIRUN_LLM_API_BASE")
+            or os.getenv("OPENAI_API_BASE")
+            or os.getenv("OPENROUTER_BASE_URL")
+            or ""
+        ).strip().rstrip("/")
+        if api_base:
+            kwargs = {**kwargs, "api_base": api_base}
     litellm.suppress_debug_info = True
     with contextlib.redirect_stdout(sys.stderr):
         try:
