@@ -756,7 +756,10 @@ def _llm_route_relevant(prompt: str, route: dict) -> bool:
     ))
     artifactish = bool(re.search(r"\b(artifact|artefakt|zapisz|dolacz|dołącz|attachment)\b", low))
     if intents.get("screen"):
-        keep = ("/screen/", "/window/", "/display/", "/surface/", "/env/")
+        # A screenshot is often the verification tail of a larger native-desktop task.
+        # Keep app launch routes visible or the planner can only focus/type into an app
+        # that it never had a way to start (observed for LibreOffice/ONLYOFFICE flows).
+        keep = ("/screen/", "/window/", "/display/", "/surface/", "/env/", "app://", "/desktop/")
         if browserish:
             keep = (*keep, "/cdp/", "/browser/", "/ui/", "/input/")
         if artifactish:
@@ -771,6 +774,33 @@ def _llm_route_relevant(prompt: str, route: dict) -> bool:
     if intents.get("processes") or intents.get("logs"):
         return any(part in uri for part in ("proc://", "log://", "shell://", "/runtime/query/health"))
     return True
+
+
+def _native_app_launch_route(allowed_routes: list[dict]) -> str:
+    for route in allowed_routes:
+        uri = str(route.get("uri") or "")
+        if uri.startswith("app://") and uri.endswith("/desktop/command/launch"):
+            return uri
+    return ""
+
+
+def _native_app_launch_requested(prompt: str, allowed_routes: list[dict]) -> bool:
+    """Whether an explicit native-app open request must contain an app launch step."""
+    if not _native_app_launch_route(allowed_routes) or first_url(prompt):
+        return False
+    low = nl_key(prompt)
+    if re.search(r"\b(browser|chrome|firefox|przegl\w+|website|stron\w+|url|cdp)\b", low):
+        return False
+    return bool(re.search(r"\b(open|launch|start|otworz\w*|uruchom\w*)\b", low))
+
+
+def _flow_has_native_app_launch(flow: dict) -> bool:
+    return any(
+        str(step.get("uri") or "").startswith("app://")
+        and str(step.get("uri") or "").endswith("/desktop/command/launch")
+        for step in (flow.get("steps") or [])
+        if isinstance(step, dict)
+    )
 
 
 def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
@@ -806,6 +836,10 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
                 "language. If the user's request is in a non-English language (like Polish), assume the UI is likely localized to that language and use appropriate translated labels (e.g. 'Zacznij publikację' instead of 'Start a post'). When targeting by 'text', omit the 'role' field if you are unsure of the exact HTML element type. "
                 "After any launch or navigation, insert an input/command/wait (a few seconds) "
                 "before the first interaction so the page can settle. "
+                "NATIVE APP LAUNCH RULE: when the user asks to open/start a native desktop app "
+                "and allowedRoutes contains app://.../desktop/command/launch, the FIRST mutating "
+                "step must call that route with payload.app set to the requested application id/name. "
+                "A window/query/list or window/command/focus step does NOT launch an application. "
                 # Launch/probe split: ensure FIRES the launch and returns fast (launching:true,
                 # port NOT bound yet); the next cdp/page/* step opens a WS to that port and
                 # would deadlock until the bind happens. session/query/ready is the idempotent
@@ -892,12 +926,24 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
     response = quiet_completion(model=model, messages=messages, temperature=0, response_format={"type": "json_object"})
     content = response.choices[0].message.content or "{}"
     flow = json_from_text(content)
-    if allowed_routes and not (isinstance(flow.get("steps"), list) and flow.get("steps")):
+    empty_plan = allowed_routes and not (isinstance(flow.get("steps"), list) and flow.get("steps"))
+    missing_native_launch = (
+        _native_app_launch_requested(prompt, allowed_routes)
+        and not _flow_has_native_app_launch(flow)
+    )
+    if empty_plan or missing_native_launch:
+        repair_reason = (
+            "Your plan targets a native desktop application but omitted its launch command. "
+            f"Include {_native_app_launch_route(allowed_routes)} before wait/focus/type steps. "
+            "window/query/list and window/command/focus only inspect or activate an already-running app. "
+            if missing_native_launch else
+            "Your JSON plan had an empty 'steps' array. That is invalid when allowedRoutes are available. "
+        )
         repair_messages = [
             *messages,
             {"role": "assistant", "content": content},
             {"role": "user", "content": (
-                "Your JSON plan had an empty 'steps' array. That is invalid when allowedRoutes are available. "
+                repair_reason +
                 "Return strict JSON again with at least one atomic step using only allowedRoutes. "
                 "For readiness/status requests, a matching query/ready or status query step is enough. "
                 "For launch/open requests, include the launch/open command and then a readiness/status query. "
@@ -915,6 +961,11 @@ def llm_flow(prompt: str, routes: list[dict], nodes: list[dict],
             response_format={"type": "json_object"},
         )
         flow = json_from_text(response.choices[0].message.content or "{}")
+    if (_native_app_launch_requested(prompt, allowed_routes)
+            and not _flow_has_native_app_launch(flow)):
+        raise ValueError(
+            "native desktop app request has no app://.../desktop/command/launch step"
+        )
     return flow
 
 
@@ -1286,8 +1337,20 @@ def make_flow(prompt: str, mesh: dict, selected_nodes: list[str] | None = None, 
             if recalled is not None:
                 flow = normalize_flow_or_explain(recalled, allowed, routes=routes,
                     selected_nodes=selected_nodes, planner_reason=str(exc), environments=environments)
-                return _inject_capture_if_needed(flow, prompt, allowed), {
-                    "provider": "recall", "fallback": True, "reason": _safe_planner_error(exc)}
+                if (not _native_app_launch_requested(prompt, routes)
+                        or _flow_has_native_app_launch(flow)):
+                    return _inject_capture_if_needed(flow, prompt, allowed), {
+                        "provider": "recall", "fallback": True, "reason": _safe_planner_error(exc)}
+            # The lexical fallback only understands conservative read-oriented intents. For an
+            # explicit native-app mutation it used to return health/capture/process queries and
+            # report ok:true, even though it never launched or operated the requested app. Fail
+            # closed instead of presenting that unrelated diagnostic flow as task completion.
+            if _native_app_launch_requested(prompt, routes):
+                raise RuntimeError(
+                    "LLM planner failed for a native desktop app request; the heuristic fallback "
+                    "cannot safely synthesize app launch and input steps. "
+                    f"Planner error: {_safe_planner_error(exc)}."
+                ) from exc
             flow = heuristic_flow(prompt, routes, mesh["nodes"], selected_nodes,
                                   use_llm=True, environments=environments)
             flow = normalize_flow_or_explain(

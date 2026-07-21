@@ -611,6 +611,23 @@ def test_make_flow_llm_outage_raises_only_in_strict_mode(monkeypatch):
         make_flow("zrob zrzut ekranu", mesh, use_llm=True)
 
 
+def test_native_app_llm_failure_does_not_claim_query_only_fallback_success(monkeypatch):
+    mesh = {
+        "nodes": [{"name": "laptop", "reachable": True}],
+        "routes": [
+            {"uri": "app://laptop/desktop/command/launch", "node": "laptop", "safe": True},
+            {"uri": "kvm://laptop/screen/query/capture", "node": "laptop", "safe": True},
+            {"uri": "kvm://laptop/input/command/type", "node": "laptop", "safe": True},
+        ],
+    }
+    monkeypatch.delenv("URIRUN_LLM_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    monkeypatch.delenv("URIRUN_STRICT_LLM_PLANNER", raising=False)
+
+    with pytest.raises(RuntimeError, match="cannot safely synthesize app launch"):
+        make_flow("otworz ONLYOFFICE i wpisz tekst", mesh, use_llm=True)
+
+
 def test_make_flow_llm_model_override_is_passed_to_provider(monkeypatch):
     mesh = {
         "nodes": [{"name": "host", "reachable": True}],
@@ -741,6 +758,67 @@ def test_llm_prompt_filters_routes_and_slenders_contracts_for_screen(monkeypatch
         "effect": "query",
         "domains": {"monitor": {"type": "enum", "domain": "env:monitors.id"}},
     }
+
+
+def test_native_office_screenshot_keeps_launch_route_and_repairs_missing_launch(monkeypatch):
+    routes = [
+        {"uri": "app://laptop/desktop/command/launch", "node": "laptop", "safe": True,
+         "inputSchema": {"type": "object", "properties": {"app": {"type": "string"}}}},
+        {"uri": "kvm://laptop/window/query/list", "node": "laptop", "safe": True,
+         "inputSchema": {"type": "object", "properties": {"app": {"type": "string"}}}},
+        {"uri": "kvm://laptop/input/command/wait", "node": "laptop", "safe": True,
+         "inputSchema": {"type": "object", "properties": {"seconds": {"type": "number"}}}},
+        {"uri": "kvm://laptop/input/command/type", "node": "laptop", "safe": True,
+         "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}},
+        {"uri": "kvm://laptop/screen/query/capture", "node": "laptop", "safe": True,
+         "inputSchema": {"type": "object", "properties": {}}},
+    ]
+    mesh = {"nodes": [{"name": "laptop", "reachable": True}], "routes": routes}
+    calls = []
+
+    class _Choice:
+        def __init__(self, content: str):
+            self.message = type("Msg", (), {"content": content})()
+
+    class _Response:
+        def __init__(self, content: str):
+            self.choices = [_Choice(content)]
+
+    def fake_completion(*, messages, **kwargs):
+        calls.append(messages)
+        if len(calls) == 1:
+            allowed = {route["uri"] for route in json.loads(messages[1]["content"])["allowedRoutes"]}
+            assert "app://laptop/desktop/command/launch" in allowed
+            return _Response(
+                '{"task":{"id":"office"},"steps":[{"id":"windows",'
+                '"uri":"kvm://laptop/window/query/list","payload":{"app":"onlyoffice"},'
+                '"depends_on":[]}]}'
+            )
+        return _Response(
+            '{"task":{"id":"office"},"steps":['
+            '{"id":"launch","uri":"app://laptop/desktop/command/launch",'
+            '"payload":{"app":"org.onlyoffice.desktopeditors"},"depends_on":[]},'
+            '{"id":"wait","uri":"kvm://laptop/input/command/wait",'
+            '"payload":{"seconds":2},"depends_on":["launch"]},'
+            '{"id":"type","uri":"kvm://laptop/input/command/type",'
+            '"payload":{"text":"Test URI process"},"depends_on":["wait"]},'
+            '{"id":"capture","uri":"kvm://laptop/screen/query/capture",'
+            '"payload":{},"depends_on":["type"]}]}'
+        )
+
+    monkeypatch.setattr(planner, "quiet_completion", fake_completion)
+
+    flow, generator = make_flow(
+        "Na laptopie otwórz ONLYOFFICE, wpisz test i zrób zrzut ekranu",
+        mesh,
+        selected_nodes=["laptop"],
+        use_llm=True,
+        llm_model="request/model",
+    )
+
+    assert generator["fallback"] is False
+    assert len(calls) == 2
+    assert flow["steps"][0]["uri"] == "app://laptop/desktop/command/launch"
 
 
 def test_llm_prompt_filters_routes_for_cdp_readiness(monkeypatch):
