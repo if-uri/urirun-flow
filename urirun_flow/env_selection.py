@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Any, Callable
 
 
@@ -286,6 +287,146 @@ def recall_env_enum_replan_required(flow: dict, routes: list[dict],
     return {"required": False}
 
 
+@dataclass
+class _EnumSlot:
+    """One enum parameter of one step, with everything a rung needs to decide."""
+
+    uri: str
+    node: str
+    param: str
+    cfg: dict
+    payload: dict
+    options: list[dict]
+    inventory: dict
+    memory: Any
+    prompt: str
+
+    def decide(self, source: str, **extra: Any) -> dict:
+        """A resolution for this parameter, recorded in ``decisions``."""
+        return {"decision": {"uri": self.uri, "parameter": self.param, "source": source, **extra}}
+
+
+def _rung_skip(slot: _EnumSlot) -> dict | None:
+    """Payload says this parameter does not apply (e.g. scope:'all')."""
+    if not _skip_by_payload(slot.payload, slot.cfg):
+        return None
+    # A prompt that names exactly ONE option label overrides the bypass:
+    # "zrzut ekranu monitora HDMI-1" with a planner-emitted scope:'all' means
+    # the user wants THAT monitor — the skip value was boilerplate.
+    prompt_value = _option_from_prompt(slot.options, slot.prompt)
+    if prompt_value is not None and prompt_value in _option_values(slot.options):
+        _drop_skip_fields(slot.payload, slot.cfg)
+        slot.payload[slot.param] = prompt_value
+        return slot.decide("prompt-label-over-skip", value=prompt_value)
+    return slot.decide("skip")
+
+
+def _rung_result_ref(slot: _EnumSlot) -> dict | None:
+    """The value arrives at runtime from an earlier step's result."""
+    if not _has_result_reference(slot.payload, str(slot.param)):
+        return None
+    return slot.decide("result-ref", **{"from": slot.payload.get(f"{slot.param}_from")})
+
+
+def _rung_explicit(slot: _EnumSlot) -> dict | None:
+    """The payload already carries a value — validate, coerce, or let a label win."""
+    if not _has_explicit(slot.payload, slot.param, slot.cfg):
+        return None
+    given = slot.payload.get(slot.param)
+    if slot.options and _value_key(given) not in _option_value_keys(slot.options):
+        coerced = _option_by_label(slot.options, given)
+        if coerced is None:
+            return {"terminal": _env_domain_invalid(
+                slot.uri, slot.node, slot.param, slot.cfg, given, slot.options)}
+        slot.payload[slot.param] = coerced
+        return slot.decide("label", value=coerced)
+    # Valid-but-conflicting guard: the user named ONE option by label and the
+    # planner's numeric value points at a different one ("monitora DP-1" but
+    # monitor:1 = HDMI-1) — the user's label wins over the model's guess.
+    prompt_value = _option_from_prompt(slot.options, slot.prompt)
+    if (prompt_value is not None and prompt_value in _option_values(slot.options)
+            and _value_key(prompt_value) != _value_key(given)):
+        slot.payload[slot.param] = prompt_value
+        return slot.decide("prompt-label-over-explicit", value=prompt_value)
+    return slot.decide("explicit")
+
+
+def _rung_single(slot: _EnumSlot) -> dict | None:
+    """Exactly one option exists — no choice to make."""
+    if len(slot.options) != 1:
+        return None
+    slot.payload[slot.param] = slot.options[0]["value"]
+    return slot.decide("single", value=slot.options[0]["value"])
+
+
+def _rung_remembered(slot: _EnumSlot) -> dict | None:
+    """Twin memory holds a preference for this node/domain fingerprint."""
+    pref_value = _preference_value(slot.memory, slot.node, slot.cfg, slot.param,
+                                   str(slot.inventory.get("fingerprint") or ""))
+    if pref_value not in _option_values(slot.options):
+        return None
+    slot.payload[slot.param] = pref_value
+    return slot.decide("remembered", value=pref_value)
+
+
+def _rung_primary(slot: _EnumSlot) -> dict | None:
+    """The prompt asks for the primary/main one (e.g. "główny monitor")."""
+    if not _prompt_requests_primary(slot.prompt):
+        return None
+    primary_value = _primary_option_value(slot.options)
+    if primary_value is None or primary_value not in _option_values(slot.options):
+        return None
+    slot.payload[slot.param] = primary_value
+    return slot.decide("primary", value=primary_value)
+
+
+def _rung_prompt_label(slot: _EnumSlot) -> dict | None:
+    """The prompt names exactly one option by its label."""
+    prompt_value = _option_from_prompt(slot.options, slot.prompt)
+    if prompt_value is None or prompt_value not in _option_values(slot.options):
+        return None
+    slot.payload[slot.param] = prompt_value
+    return slot.decide("prompt-label", value=prompt_value)
+
+
+def _rung_needs_selection(slot: _EnumSlot) -> dict | None:
+    """Several options and nothing to choose by — ask, never guess."""
+    if len(slot.options) <= 1:
+        return None
+    return {"terminal": _needs_selection(slot.uri, slot.node, slot.param, slot.cfg,
+                                         slot.options, slot.inventory)}
+
+
+# Resolution ladder for one enum parameter, in precedence order. Each rung
+# returns {"decision": …} (resolved), {"terminal": …} (stop the whole flow) or
+# None to fall through to the next one.
+_ENUM_RUNGS = (
+    _rung_skip,
+    _rung_result_ref,
+    _rung_explicit,
+    _rung_single,
+    _rung_remembered,
+    _rung_primary,
+    _rung_prompt_label,
+    _rung_needs_selection,
+)
+
+
+def _resolve_slot(slot: _EnumSlot) -> dict:
+    """Walk the ladder; an unresolved parameter is reported, not guessed."""
+    for rung in _ENUM_RUNGS:
+        outcome = rung(slot)
+        if outcome is not None:
+            return outcome
+    return slot.decide("unresolved")
+
+
+def _enum_params(domains: dict) -> list[tuple[str, dict]]:
+    """Route parameters that draw from an environment domain."""
+    return [(param, cfg) for param, cfg in domains.items()
+            if isinstance(cfg, dict) and cfg.get("type") == "enum" and cfg.get("domain")]
+
+
 def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dict] | list[dict],
                       memory: Any = None, prompt: str = "") -> dict:
     """Return ``{ok, flow, decisions}`` or ``needs-selection`` for unresolved env enums."""
@@ -295,77 +436,17 @@ def resolve_env_enums(flow: dict, routes: list[dict], inventories: dict[str, dic
         uri = str(step.get("uri") or "")
         payload = dict(step.get("payload") or {})
         node = _target(uri)
-        domains = _route_domains(uri, routes)
         inventory = _inventory_for(node, inventories)
-        for param, cfg in domains.items():
-            if not isinstance(cfg, dict) or cfg.get("type") != "enum" or not cfg.get("domain"):
-                continue
-            if _skip_by_payload(payload, cfg):
-                # A prompt that names exactly ONE option label overrides the bypass:
-                # "zrzut ekranu monitora HDMI-1" with a planner-emitted scope:'all' means
-                # the user wants THAT monitor — the skip value was boilerplate.
-                skip_options = _domain_options(inventory, str(cfg["domain"]))
-                prompt_value = _option_from_prompt(skip_options, prompt)
-                if prompt_value is not None and prompt_value in _option_values(skip_options):
-                    _drop_skip_fields(payload, cfg)
-                    payload[param] = prompt_value
-                    decisions.append({"uri": uri, "parameter": param,
-                                      "source": "prompt-label-over-skip", "value": prompt_value})
-                    continue
-                decisions.append({"uri": uri, "parameter": param, "source": "skip"})
-                continue
-            if _has_result_reference(payload, str(param)):
-                decisions.append({"uri": uri, "parameter": param, "source": "result-ref",
-                                  "from": payload.get(f"{param}_from")})
-                continue
-            options = _domain_options(inventory, str(cfg["domain"]))
-            if _has_explicit(payload, param, cfg):
-                if options and _value_key(payload.get(param)) not in _option_value_keys(options):
-                    coerced = _option_by_label(options, payload.get(param))
-                    if coerced is None:
-                        return {**_env_domain_invalid(uri, node, param, cfg, payload.get(param), options), "flow": flow}
-                    payload[param] = coerced
-                    decisions.append({"uri": uri, "parameter": param, "source": "label",
-                                      "value": coerced})
-                    continue
-                # Valid-but-conflicting guard: the user named ONE option by label and the
-                # planner's numeric value points at a different one ("monitora DP-1" but
-                # monitor:1 = HDMI-1) — the user's label wins over the model's guess.
-                prompt_value = _option_from_prompt(options, prompt)
-                if (prompt_value is not None and prompt_value in _option_values(options)
-                        and _value_key(prompt_value) != _value_key(payload.get(param))):
-                    payload[param] = prompt_value
-                    decisions.append({"uri": uri, "parameter": param,
-                                      "source": "prompt-label-over-explicit", "value": prompt_value})
-                    continue
-                decisions.append({"uri": uri, "parameter": param, "source": "explicit"})
-                continue
-            if len(options) == 1:
-                payload[param] = options[0]["value"]
-                decisions.append({"uri": uri, "parameter": param, "source": "single",
-                                  "value": options[0]["value"]})
-                continue
-            pref_value = _preference_value(memory, node, cfg, param, str(inventory.get("fingerprint") or ""))
-            if pref_value in _option_values(options):
-                payload[param] = pref_value
-                decisions.append({"uri": uri, "parameter": param, "source": "remembered",
-                                  "value": pref_value})
-                continue
-            primary_value = _primary_option_value(options) if _prompt_requests_primary(prompt) else None
-            if primary_value is not None and primary_value in _option_values(options):
-                payload[param] = primary_value
-                decisions.append({"uri": uri, "parameter": param, "source": "primary",
-                                  "value": primary_value})
-                continue
-            prompt_value = _option_from_prompt(options, prompt)
-            if prompt_value is not None and prompt_value in _option_values(options):
-                payload[param] = prompt_value
-                decisions.append({"uri": uri, "parameter": param, "source": "prompt-label",
-                                  "value": prompt_value})
-                continue
-            if len(options) > 1:
-                return {**_needs_selection(uri, node, param, cfg, options, inventory), "flow": flow}
-            decisions.append({"uri": uri, "parameter": param, "source": "unresolved"})
+        for param, cfg in _enum_params(_route_domains(uri, routes)):
+            slot = _EnumSlot(
+                uri=uri, node=node, param=param, cfg=cfg, payload=payload,
+                options=_domain_options(inventory, str(cfg["domain"])),
+                inventory=inventory, memory=memory, prompt=prompt,
+            )
+            outcome = _resolve_slot(slot)
+            if "terminal" in outcome:
+                return {**outcome["terminal"], "flow": flow}
+            decisions.append(outcome["decision"])
         out_steps.append({**step, "payload": payload})
     return {"ok": True, "flow": {**flow, "steps": out_steps}, "decisions": decisions}
 
