@@ -1,7 +1,17 @@
-.PHONY: help test conformance
+PYTHON ?= python3
+
+.PHONY: help test conformance doctor-build doctor-test doctor-health
 help: ## Show commands
 	@grep -E "^[a-zA-Z_-]+:.*?## .*$$" $(MAKEFILE_LIST) | awk "BEGIN{FS=\":.*?## \"}{printf \"  %-12s %s\\n\",\$$1,\$$2}"
-test: ## Run the test suite (+ conformance)
-	python -m pytest tests/ -q
+test: doctor-test conformance ## Run the test suite (+ conformance)
 conformance: ## Check every language emitter agrees with the Python reference
-	python conformance.py
+	$(PYTHON) conformance.py
+
+doctor-build:
+	$(PYTHON) -m pip install --no-deps --no-build-isolation -e .
+
+doctor-test:
+	$(PYTHON) -m pytest tests/ -q
+
+doctor-health:
+	$(PYTHON) -c "import urirun_flow"
