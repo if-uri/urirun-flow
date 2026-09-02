@@ -8,7 +8,7 @@ conformance: ## Check every language emitter agrees with the Python reference
 	$(PYTHON) conformance.py
 
 doctor-build:
-	$(PYTHON) -m pip install -e ".[test,run]"
+	$(PYTHON) -m pip install --no-deps --no-build-isolation -e .
 
 doctor-test:
 	$(PYTHON) -m pytest tests/ -q

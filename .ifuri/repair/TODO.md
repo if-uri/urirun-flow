@@ -9,3 +9,4 @@ Correlation ID: `33156820757`
 - [x] Document only supported planner settings without credentials.
 - [x] Expose the declared OneDev and Validator build, test, and health gates.
 - [x] Install the declared runtime extra in CI so the full suite can collect.
+- [x] Keep the OneDev candidate build offline and isolated from dependency resolution.
