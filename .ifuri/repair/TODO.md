@@ -8,3 +8,4 @@ Correlation ID: `33156820757`
 - [x] Remove stale ignore rules so the template remains trackable.
 - [x] Document only supported planner settings without credentials.
 - [x] Expose the declared OneDev and Validator build, test, and health gates.
+- [x] Install the declared runtime extra in CI so the full suite can collect.
