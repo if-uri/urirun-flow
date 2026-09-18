@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-18
+
+### Changed
+- NL planning fallback is now a declarative prompt compiler
+  (`urirun_flow.flow_compiler`): when the primary LLM planner fails while a
+  model is still configured, one schema-bound compile against the allowed
+  route table produces the `urirun.flow.v1` document directly. The compiled
+  document is validated fail-closed (allowed URIs only, backward-only
+  `depends_on`, bounded sizes); any violation, transport error or omitted
+  native-app launch degrades to the offline safe fallback (subactor/report#13,
+  STARTER-132).
+- Removed the boolean LLM intent-classification branch
+  (`_flow_intents_llm`): `_flow_intents`/`_flow_intents_lexical` and
+  `heuristic_flow` now serve only as the offline safe fallback and the
+  conservative context gates; `heuristic_flow`'s `use_llm` parameter is
+  retained for signature compatibility and ignored.
+
+### Added
+- `urirun_flow/flow_compiler.py` with `compile_flow`, `parse_flow_v1` and the
+  declarative `FLOW_V1_SHAPE` prompt contract; `make_flow` reports the new
+  `provider: "flow-compiler"` generator marker with `fallback: true`.
+
+
 ## [0.2.3] - 2026-07-05
 
 ### Docs
