@@ -129,7 +129,6 @@ from .flow_planner import (
     nl_key,
     append_if_available,
     requested_folder_path,
-    _flow_intents_llm,
     _flow_intents,
     _append_target_steps,
     heuristic_flow,

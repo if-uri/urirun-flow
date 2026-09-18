@@ -2,9 +2,11 @@
 # Part of the ifURI solution.
 #
 # Plan-generation layer extracted from flow.py. Contains all NL→URI planning
-# helpers: intent classification, heuristic flow building, LLM flow generation,
-# flow normalization, planner environment fetching, and the thin kvm-query
-# helpers used both by the planner and by the execution self-heal path.
+# helpers: the offline lexical safe-fallback classifier, heuristic offline flow
+# building, LLM flow generation, the declarative urirun.flow.v1 prompt compiler
+# (flow_compiler), flow normalization, planner environment fetching, and the
+# thin kvm-query helpers used both by the planner and by the execution
+# self-heal path.
 from __future__ import annotations
 
 import json
@@ -16,6 +18,7 @@ from urirun.runtime import v2_service
 from urirun.node.reversible import TwinMemory
 from urirun_flow.envelope import result_data
 from urirun_flow._util import now_id, quiet_completion, slug
+from urirun_flow.flow_compiler import compile_flow
 from urirun_connector_router.routing import (
     registry_from_routes,
     route_target,
@@ -85,38 +88,14 @@ def _configured_llm_model(override: str | None = None) -> str | None:
     return None
 
 
-def _flow_intents_llm(prompt: str, llm_model: str | None = None) -> dict[str, bool] | None:
-    """Ask the LLM to classify the prompt into the known intent set.
-
-    Returns a complete {intent: bool} dict on success, None when LLM is not
-    configured or the call fails — callers fall back to the default intent."""
-    model = _configured_llm_model(llm_model)
-    if not model:
-        return None
-    try:
-        import json as _json
-        names_csv = ", ".join(sorted(_INTENT_NAMES))
-        resp = quiet_completion(
-            model=model,
-            messages=[
-                {"role": "system", "content": (
-                    f"Classify the user prompt. Return JSON with boolean fields: {names_csv}. "
-                    "Set true for each capability the user clearly wants to use. "
-                    "Respond with JSON only, no commentary."
-                )},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-        parsed = _json.loads(resp.choices[0].message.content or "{}")
-        return {k: bool(parsed.get(k, False)) for k in _INTENT_NAMES}
-    except Exception:  # noqa: BLE001 — LLM unavailable must not crash the heuristic path
-        return None
-
-
 def _flow_intents_lexical(prompt: str) -> dict[str, bool]:
-    """Conservative no-LLM classifier for explicit, read-oriented host tasks."""
+    """Offline safe-fallback classifier for explicit, read-oriented host tasks.
+
+    STARTER-132: no longer part of the LLM planning path — the declarative
+    flow_compiler replaced intent classification + procedural graph building.
+    This classifier survives only inside the offline safe fallback
+    (``heuristic_flow``) and the conservative context gates
+    (``_prompt_needs_window_inventory``, ``_llm_route_relevant``)."""
     lowered = nl_key(prompt)
     intents = {k: False for k in _INTENT_NAMES}
 
@@ -140,25 +119,16 @@ def _flow_intents_lexical(prompt: str) -> dict[str, bool]:
 
 
 def _flow_intents(prompt: str, *, use_llm: bool = True) -> dict[str, bool]:
-    """Classify the prompt into host intents.
+    """Classify the prompt into host intents for the offline safe fallback.
 
-    With ``use_llm=True`` (default) attempts LLM classification. Returns the LLM
-    result when available; if LLM is not configured or fails, falls back to a
-    conservative lexical classifier for explicit read-oriented tasks.
-
-    With ``use_llm=False`` skips LLM entirely and uses the same lexical
-    classifier. Unrecognized prompts still produce no steps rather than a silent
-    broad guess."""
-    if not use_llm:
-        return _flow_intents_lexical(prompt)
-    intents = _flow_intents_llm(prompt)
-    if intents is None:
-        return _flow_intents_lexical(prompt)
-    if not any(intents.values()):
-        intents = _flow_intents_lexical(prompt)
-        if not any(intents.values()):
-            intents["processes"] = True
-    return intents
+    STARTER-132: the LLM intent-classification branch was removed — when an
+    LLM is available, the declarative flow_compiler emits the whole
+    urirun.flow.v1 document instead of feeding boolean intents into the
+    procedural graph builder. ``use_llm`` is retained for signature
+    compatibility and is ignored; this function is now always the conservative
+    lexical classifier. Unrecognized prompts still produce no steps rather
+    than a silent broad guess."""
+    return _flow_intents_lexical(prompt)
 
 
 # ── Heuristic flow building ───────────────────────────────────────────────────
@@ -333,6 +303,13 @@ def _prompt_needs_window_inventory(prompt: str) -> bool:
 
 def heuristic_flow(prompt: str, routes: list[dict], nodes: list[dict], selected_nodes: list[str] | None = None,
                    *, use_llm: bool = True, environments: list[dict] | None = None) -> dict:
+    """Offline safe-fallback flow builder (STARTER-132).
+
+    Pure lexical classifier + procedural step assembly; ``use_llm`` is retained
+    for signature compatibility and ignored — the LLM planning path is
+    ``llm_flow`` (lead) plus the declarative ``flow_compiler`` (schema-bound
+    retry), and this deterministic builder serves only when both are
+    unavailable or fail."""
     selected = target_nodes(prompt, nodes, selected_nodes)
 
     def selected_route(route: dict) -> bool:
@@ -1341,6 +1318,34 @@ def make_flow(prompt: str, mesh: dict, selected_nodes: list[str] | None = None, 
                         or _flow_has_native_app_launch(flow)):
                     return _inject_capture_if_needed(flow, prompt, allowed), {
                         "provider": "recall", "fallback": True, "reason": _safe_planner_error(exc)}
+            # STARTER-132: while an LLM is still configured, retry through the
+            # declarative flow_compiler — a schema-bound single-shot compile that
+            # replaces the retired boolean-intent classification + procedural
+            # graph assembly. Any violation, transport error or native-launch
+            # omission falls through to the guards and the offline safe fallback.
+            compiler_model = _configured_llm_model(llm_model)
+            if compiler_model:
+                try:
+                    compiled = compile_flow(
+                        prompt, routes, mesh["nodes"], selected_nodes,
+                        complete=quiet_completion, llm_model=compiler_model,
+                    )
+                    if (not _native_app_launch_requested(prompt, routes)
+                            or _flow_has_native_app_launch(compiled)):
+                        flow = normalize_flow_or_explain(
+                            compiled,
+                            allowed,
+                            routes=routes,
+                            selected_nodes=selected_nodes,
+                            planner_reason=str(exc),
+                            environments=environments,
+                        )
+                        return _inject_capture_if_needed(flow, prompt, allowed), {
+                            "provider": "flow-compiler", "fallback": True,
+                            "model": compiler_model,
+                            "reason": _safe_planner_error(exc)}
+                except Exception:  # noqa: BLE001, SIM105 - compiler outage degrades below
+                    pass
             # The lexical fallback only understands conservative read-oriented intents. For an
             # explicit native-app mutation it used to return health/capture/process queries and
             # report ok:true, even though it never launched or operated the requested app. Fail
@@ -1352,7 +1357,7 @@ def make_flow(prompt: str, mesh: dict, selected_nodes: list[str] | None = None, 
                     f"Planner error: {_safe_planner_error(exc)}."
                 ) from exc
             flow = heuristic_flow(prompt, routes, mesh["nodes"], selected_nodes,
-                                  use_llm=True, environments=environments)
+                                  use_llm=False, environments=environments)
             flow = normalize_flow_or_explain(
                 flow,
                 allowed,
