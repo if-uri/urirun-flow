@@ -255,3 +255,26 @@ __marimo__/
 # urirun generated discovery cache (embeds per-run timestamps — not source)
 .urirun/discovered-registry.json
 **/.urirun/discovered-registry.json
+
+!.github/
+!.github/**
+!.cursor/
+!.cursor/**
+!.cursor*
+!.aider*
+!.aider.conf.yml
+!scripts/
+!scripts/**
+!project/
+!project/**
+!.subactor/
+!.subactor/**
+
+# Repository-local worktrees and operational state
+/.worktrees/
+/.subactor/leases/
+/.subactor/sessions/
+/.subactor/recovery/
+/.subactor/receipts/
+/.subactor/cache/
+/.subactor/snapshots/
