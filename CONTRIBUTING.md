@@ -19,3 +19,10 @@ submit through [connect.ifuri.com](https://connect.ifuri.com). Every connector e
 
 ## License
 By contributing you agree your work is licensed under this repository's `LICENSE`.
+
+
+```dsl
+DOCUMENT contributing
+VERSION 1
+MODE STRICT
+```
